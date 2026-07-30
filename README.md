@@ -99,12 +99,15 @@ its own:
   checks in workflow-declaration order, so comparing raw made the tool report a
   phantom change and rewrite the ruleset on every run.
 - **`tests/test_guard.py`** — assembles a throwaway repo out of `templates/`,
-  confirms the guard passes, then breaks it **twelve ways** and confirms the
+  confirms the guard passes, then breaks it **thirteen ways** and confirms the
   guard fails on *exactly* the intended tests and no others: job renamed, seam
   added but not required, rule dropped, rule emptied, strict mode off, CI trigger
   moved off the protected branch, force-push unblocked, pull request no longer
-  required, ruleset retargeted to another branch and to tags, enforcement
-  disabled and set to `evaluate`.
+  required, ruleset retargeted to another branch and to tags, protected branch
+  excluded from its own ruleset, enforcement disabled and set to `evaluate`.
+
+  That number is read back out of this file and asserted against the mutation
+  list, so it cannot drift the way the test count it replaced did.
 
   "And no others" matters as much as the rest — a mutation that trips six tests
   means the message someone reads won't name what broke.

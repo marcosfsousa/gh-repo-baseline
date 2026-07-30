@@ -6,7 +6,7 @@
 That file is a guard, and a guard that cannot go red is not a guard. Asserting it
 passes on a correct repo proves almost nothing — a file containing no assertions
 at all would do the same. So this suite assembles a throwaway repo out of
-``templates/``, checks the guard passes, and then breaks the repo twelve
+``templates/``, checks the guard passes, and then breaks the repo thirteen
 different ways and checks the guard fails **on exactly the intended tests and no
 others**.
 
@@ -21,6 +21,7 @@ nested run picks up neither this ``pytest.ini`` nor these fixtures.
 """
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -179,10 +180,29 @@ class TestTheGuardPasses:
              "-q", "--no-header", "--collect-only", "-p", "no:cacheprovider"],
             capture_output=True, text=True,
         )
-        assert "20 tests collected" in result.stdout, result.stdout[-600:]
+        assert "21 tests collected" in result.stdout, result.stdout[-600:]
+
+    def test_the_readme_states_the_right_number_of_mutations(self):
+        # README.md quotes this count in prose. The stale `# 48 tests` it used to
+        # carry was dropped rather than corrected, and replacing it with another
+        # hand-maintained number would have re-created exactly that problem one
+        # line down. So the number is read back and asserted instead.
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        stated = re.search(r"breaks it \*\*(\w+) ways\*\*", readme)
+        assert stated, "README.md no longer states how many ways the guard is broken"
+        words = {
+            8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
+            13: "thirteen", 14: "fourteen", 15: "fifteen", 16: "sixteen",
+        }
+        assert stated.group(1) == words[len(MUTATIONS)], (
+            f"README.md says the guard is broken {stated.group(1)!r} ways; "
+            f"MUTATIONS has {len(MUTATIONS)} entries "
+            f"({words[len(MUTATIONS)]!r}).\nUpdate the README, and the list of "
+            "mutations it enumerates alongside the number."
+        )
 
 
-# ── The guard on twelve broken repos ──────────────────────────────────────────
+# ── The guard on thirteen broken repos ────────────────────────────────────────
 #
 # Each entry is (label, mutation, the exact set of tests that must fail).
 
@@ -275,6 +295,18 @@ MUTATIONS = [
         id="the-ruleset-is-retargeted-to-tags",
         # Name, rules and ref_name condition all survive; `refs/heads/main`
         # simply matches no tag, so the whole thing enforces against nothing.
+    ),
+    pytest.param(
+        lambda root: _write_ruleset(root, {
+            **_read_ruleset(root),
+            "conditions": {"ref_name": {
+                "include": ["refs/heads/main"], "exclude": ["refs/heads/main"],
+            }},
+        }),
+        {"test_the_protected_branch_is_not_excluded"},
+        id="the-protected-branch-is-excluded",
+        # The include still names the branch, so the retarget mutation above
+        # does not catch this. `exclude` wins, and the ruleset covers nothing.
     ),
 ]
 

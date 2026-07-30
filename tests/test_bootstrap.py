@@ -433,7 +433,14 @@ class TestPlanAndVisibilityGating:
         assert report.changed == 0
 
 
-_OUTPUT_CALLS = {"print", "sys.exit", "parser.error"}
+# `argparse.ArgumentParser(description=..., epilog=...)` and
+# `parser.add_argument(help=...)` all reach the console through `--help`, which
+# is output like any other. The --dry-run help text is several lines long, so
+# this is not a theoretical surface.
+_OUTPUT_CALLS = {
+    "print", "sys.exit", "parser.error",
+    "argparse.ArgumentParser", "parser.add_argument",
+}
 
 # Reporter.ok and Reporter.did print their argument, so a string handed to either
 # reaches the console without ever appearing inside a `print(...)` call. Matched
@@ -546,6 +553,12 @@ class TestOutputIsConsoleSafe:
         # Matched on the method name, not on the receiver, so this cannot be
         # disabled by a rename that looks entirely innocent in a diff.
         assert _non_ascii_in_output('r.did("x — y")') == {"—"}
+
+    def test_argparse_help_text_is_scanned(self):
+        # `--help` is output. The long --dry-run help string makes this a real
+        # surface rather than a theoretical one.
+        assert _non_ascii_in_output('parser.add_argument("--x", help="a — b")') == {"—"}
+        assert _non_ascii_in_output('argparse.ArgumentParser(description="a — b")') == {"—"}
 
     def test_the_script_really_does_route_output_through_those_sinks(self):
         # A floor under the two tests above: if Reporter.ok/did stopped being

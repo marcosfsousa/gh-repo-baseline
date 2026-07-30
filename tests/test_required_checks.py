@@ -76,6 +76,7 @@ gets copied into other repos and has to stand alone. Change one, change both.
 
 import json
 import re
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -400,8 +401,30 @@ class TestRulesetKeepsItsBaseline:
         expected = [f"refs/heads/{_PROTECTED_BRANCH}"]
         assert include == expected, (
             f"The ruleset targets {include}, not {expected}.\n"
-            "Widening this is fine; narrowing or moving it leaves the branch "
-            "everything ships from unprotected."
+            "This is exact equality, so widening it fails here too — deliberately. "
+            "Widening is a real decision and should cost a line in this test "
+            "rather than passing silently; narrowing or moving it leaves the "
+            "branch everything ships from unprotected."
+        )
+
+    def test_the_protected_branch_is_not_excluded(self):
+        # `exclude` wins over `include`, and nothing above reads it. A ruleset
+        # that includes refs/heads/main and excludes it too keeps its name, its
+        # target, its enforcement and every rule — and covers nothing. Same shape
+        # as a ruleset retargeted to tags, one key over, and it was invisible
+        # here until it was asserted.
+        #
+        # Patterns are matched with fnmatch, which is close to GitHub's ref
+        # syntax but not identical; an exotic pattern that covers the branch
+        # without matching here would still slip past.
+        ref = f"refs/heads/{_PROTECTED_BRANCH}"
+        exclude = _load_ruleset().get("conditions", {}).get("ref_name", {}).get("exclude", [])
+        covering = [pattern for pattern in exclude if fnmatch(ref, pattern)]
+        assert not covering, (
+            f"The ruleset excludes {ref} via {covering}.\n"
+            "An exclude overrides the include, so the rules apply to nothing "
+            "while the ruleset still reads as active and correctly targeted in "
+            "the settings UI and in this file."
         )
 
     def test_branches_must_be_up_to_date(self):
