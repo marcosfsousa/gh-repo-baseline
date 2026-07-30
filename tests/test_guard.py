@@ -6,7 +6,7 @@
 That file is a guard, and a guard that cannot go red is not a guard. Asserting it
 passes on a correct repo proves almost nothing — a file containing no assertions
 at all would do the same. So this suite assembles a throwaway repo out of
-``templates/``, checks the guard passes, and then breaks the repo thirteen
+``templates/``, checks the guard passes, and then breaks the repo fifteen
 different ways and checks the guard fails **on exactly the intended tests and no
 others**.
 
@@ -180,7 +180,7 @@ class TestTheGuardPasses:
              "-q", "--no-header", "--collect-only", "-p", "no:cacheprovider"],
             capture_output=True, text=True,
         )
-        assert "21 tests collected" in result.stdout, result.stdout[-600:]
+        assert "25 tests collected" in result.stdout, result.stdout[-600:]
 
     def test_the_readme_states_the_right_number_of_mutations(self):
         # README.md quotes this count in prose. The stale `# 48 tests` it used to
@@ -202,7 +202,7 @@ class TestTheGuardPasses:
         )
 
 
-# ── The guard on thirteen broken repos ────────────────────────────────────────
+# ── The guard on fifteen broken repos ────────────────────────────────────────
 #
 # Each entry is (label, mutation, the exact set of tests that must fail).
 
@@ -249,10 +249,41 @@ MUTATIONS = [
     ),
     pytest.param(
         lambda root: _edit_workflow(root, "branches: [main]", "branches: [develop]"),
-        {"test_ci_runs_on_the_protected_branch", "test_trigger_branches_are_collected"},
+        {"test_ci_runs_on_the_protected_branch"},
         id="ci-stops-running-on-the-protected-branch",
         # The other side of the same failure: the checks are required and can
         # never report.
+    ),
+    pytest.param(
+        lambda root: _edit_workflow(
+            root,
+            "  pull_request:\n    branches: [main]",
+            "  pull_request:\n    branches-ignore: [main]",
+        ),
+        {"test_ci_runs_on_the_protected_branch"},
+        id="ci-is-told-to-skip-the-protected-branch",
+        # The inverse filter, and the regression test for the fail-closed half of
+        # `_trigger_branches`. An event with no `branches:` key now passes,
+        # because running on every branch covers the protected one — so a shape
+        # the parser does not evaluate must be recorded as unproven rather than
+        # falling through to that pass. `branches-ignore: [main]` is the case
+        # where the difference is the whole answer.
+    ),
+    pytest.param(
+        lambda root: _edit_workflow(
+            root,
+            "  pull_request:\n    branches: [main]",
+            "  pull_request:\n      branches: [develop]",
+        ),
+        {"test_ci_runs_on_the_protected_branch"},
+        id="the-branch-filter-moves-somewhere-the-parser-must-still-see",
+        # Same defect as the mutation above, reached by indentation rather than
+        # by key name. Six spaces is ordinary YAML and the filter is real, so the
+        # only way this passes is if the parser failed to *see* it and defaulted
+        # to unfiltered — which is the fail-open direction, and the one no
+        # assertion catches downstream. Kept end-to-end rather than left to the
+        # unit test because that default is reached through the guard's own
+        # assertion, not through the parser's return value alone.
     ),
     pytest.param(
         lambda root: _drop_rule(root, "non_fast_forward"),
