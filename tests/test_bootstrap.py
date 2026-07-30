@@ -94,6 +94,83 @@ class TestJobContexts:
         with pytest.raises(SystemExit):
             boot._job_contexts(workflow)
 
+    def test_a_job_key_with_a_trailing_comment_is_still_a_job(self, boot, tmp_path):
+        # The end-of-line anchor this used to carry dropped the job entirely and
+        # left the parser's cursor on the job above, so the `name:` below was
+        # attributed to *that* job — one comment, two wrong answers, neither loud.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  first:\n"
+            "    name: The first job\n"
+            "  gate:  # the one that blocks a merge\n"
+            "    name: The gate\n",
+            encoding="utf-8",
+        )
+        assert boot._job_contexts(workflow) == ["The first job", "The gate"]
+
+    def test_a_job_key_this_parser_cannot_read_exits(self, boot, tmp_path):
+        # Fails closed rather than skipping: a skipped key leaves the next
+        # `name:` overwriting a context that was correct.
+        for key in ('  "quoted id":', "  has spaces:", "  value: here"):
+            workflow = tmp_path / "w.yml"
+            workflow.write_text(
+                f"jobs:\n  first:\n    name: The first job\n{key}\n"
+                "    name: Not the first job\n",
+                encoding="utf-8",
+            )
+            with pytest.raises(SystemExit):
+                boot._job_contexts(workflow)
+
+    def test_a_matrix_job_exits_naming_the_job(self, boot, tmp_path):
+        # GitHub reports `pytest (3.11)`, never `pytest`. Writing `pytest` into a
+        # ruleset requires a check nothing ever reports — the pending-forever
+        # failure, created by the tool that exists to prevent it.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  pytest:\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        python-version: ['3.11', '3.12']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit, match="pytest"):
+            boot._job_contexts(workflow)
+
+    def test_a_strategy_without_a_matrix_is_not_refused(self, boot, tmp_path):
+        # `fail-fast` alone does not compose the context, and refusing a correct
+        # workflow is the direction that gets a tool worked around.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  pytest:\n    strategy:\n      fail-fast: false\n    name: The gate\n",
+            encoding="utf-8",
+        )
+        assert boot._job_contexts(workflow) == ["The gate"]
+
+    def test_a_reusable_workflow_job_exits(self, boot, tmp_path):
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  build:\n    uses: ./.github/workflows/shared.yml\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit, match="reusable workflow"):
+            boot._job_contexts(workflow)
+
+    def test_a_step_that_uses_an_action_is_not_a_reusable_workflow(self, boot, tmp_path):
+        # `- uses:` at six spaces is a step. Matching it would refuse nearly every
+        # real workflow, so the distinction is structural and asserted directly.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  build:\n"
+            "    name: The gate\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v4\n",
+            encoding="utf-8",
+        )
+        assert boot._job_contexts(workflow) == ["The gate"]
+
     def test_a_name_this_parser_refuses_exits_naming_the_job(self, boot, tmp_path):
         # The refusal has to identify the job, or a person reading it has to find
         # the offending line themselves in a workflow that may have many.
@@ -208,6 +285,37 @@ class TestBothParserCopiesAgree:
         # actually decides whether this repo's branch protection is attached.
         workflow = REPO_ROOT / ".github" / "workflows" / "ci.yml"
         assert list(template_guard._job_contexts(workflow).values()) == boot._job_contexts(workflow)
+
+    @pytest.mark.parametrize("workflow_text", [
+        "jobs:\n  first:\n    name: A\n  gate:  # trailing\n    name: B\n",
+        "jobs:\n  pytest:\n    strategy:\n      matrix:\n        v: [1, 2]\n",
+        "jobs:\n  pytest:\n    strategy:\n      fail-fast: false\n    name: The gate\n",
+        "jobs:\n  build:\n    uses: ./.github/workflows/shared.yml\n",
+        "jobs:\n  build:\n    name: B\n    steps:\n      - uses: actions/checkout@v4\n",
+        'jobs:\n  first:\n    name: A\n  "quoted id":\n    name: B\n',
+        "jobs:\n  first:\n    name: A\n  value: here\n    name: B\n",
+    ])
+    def test_same_refusals_for_composed_and_unreadable_job_keys(
+        self, boot, template_guard, tmp_path, workflow_text
+    ):
+        # The shapes where the two copies most easily drift, because each refuses
+        # through its own mechanism — `ValueError` in the guard, `sys.exit` in the
+        # tool. Compared on *whether* each refuses, so a fix applied to one copy
+        # and not the other is caught here rather than in whichever repo copied
+        # the stale one.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(workflow_text, encoding="utf-8")
+
+        def refused(call):
+            try:
+                call()
+            except (ValueError, SystemExit):
+                return True
+            return False
+
+        assert refused(lambda: template_guard._job_contexts(workflow)) == refused(
+            lambda: boot._job_contexts(workflow)
+        ), workflow_text
 
     def test_same_comment_stripping(self, boot, template_guard):
         # `#` opens a comment at line start or after whitespace only, per YAML, so

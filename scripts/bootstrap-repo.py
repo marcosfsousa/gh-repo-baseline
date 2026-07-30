@@ -268,6 +268,14 @@ def _job_contexts(workflow: Path) -> list[str]:
     Step names are ``- name:`` at six spaces and are therefore excluded
     structurally rather than by pattern.
 
+    A job key is recognised by its shape before its id is read, so a key this
+    cannot vouch for stops the run instead of being skipped -- skipping left the
+    key's own job uncollected *and* attributed the ``name:`` below it to the job
+    above. A job whose context GitHub composes (``strategy.matrix``, or ``uses:``
+    for a reusable workflow) is refused for the same reason ``_scalar`` refuses a
+    block scalar: requiring a context nothing reports leaves a pull request
+    pending rather than red. Pass those with ``--check`` instead.
+
     The copy in ``templates/tests/test_required_checks.py`` returns
     ``{job id: context}`` where this returns just the contexts — it needs the id
     to name the job whose ``name:`` moved, and this only needs the strings to
@@ -282,18 +290,69 @@ def _job_contexts(workflow: Path) -> list[str]:
     except StopIteration:
         sys.exit(f"{workflow} has no top-level `jobs:` block.")
 
+    def _refuse(job: str, what: str, fix: str) -> None:
+        sys.exit(
+            f"{workflow}, job {job!r}: {what}, so the check it reports is not "
+            f"the job id or its `name:`.\nThis parser will not guess at a "
+            f"composed context. {fix}"
+        )
+
     current: str | None = None
+    strategy_of: str | None = None  # the job whose `strategy:` we are inside
     for line in lines[start + 1:]:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         # A non-indented key ends the jobs block.
         if not line.startswith(" "):
             break
-        job = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
-        if job:
-            current = job.group(1)
+        # Matched on the key *shape* -- two spaces, then anything up to a colon --
+        # rather than on the id charset, so an id this cannot read is refused
+        # below instead of falling through to the `name:` branch with `current`
+        # still naming the previous job.
+        key = re.match(r"^  (\S[^:]*):(.*)$", line)
+        if key:
+            job_id, trailing = key.group(1), _strip_comment(key.group(2))
+            if trailing:
+                sys.exit(
+                    f"{workflow}: `{job_id}:` sits where a job id belongs but "
+                    f"carries the value {trailing!r}.\nA job maps to a block. "
+                    "This parser stops rather than attributing the keys below it "
+                    "to the job above."
+                )
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+                sys.exit(
+                    f"{workflow}: {job_id!r} is not a job id this parser can "
+                    "read.\nGitHub allows letters, digits, `-` and `_`. Anything "
+                    "else stops the parse rather than leaving the keys below it "
+                    "attributed to the job above."
+                )
+            current = job_id
+            strategy_of = None
             contexts[current] = current  # the id is the context until a name says otherwise
             continue
+        if current is None:
+            continue
+        # `uses:` at four spaces is a reusable-workflow call; a step's is `- uses:`
+        # at six and does not match.
+        if re.match(r"^    uses\s*:", line):
+            _refuse(
+                current,
+                "calls a reusable workflow, so GitHub reports it as "
+                "`caller / called`",
+                "Pass that context with --check, or inline the job.",
+            )
+        if re.match(r"^    strategy\s*:", line):
+            strategy_of = current
+            continue
+        if re.match(r"^    \S", line):
+            strategy_of = None  # a sibling key ended the strategy block
+        if strategy_of == current and re.match(r"^      matrix\s*:", line):
+            _refuse(
+                current,
+                "is a matrix job, so GitHub reports one suffixed check per "
+                f"combination (`{current} (3.11)`) and none named `{current}`",
+                "Pass each combination with --check, or drop the matrix.",
+            )
         name = re.match(r"^    name:\s*(.+)$", line)
         if name and current:
             try:
