@@ -226,12 +226,62 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
 
 
 # The event-level keys that decide whether a workflow reports on a given push or
-# pull request. Longest-first, because the alternation below is first-match-wins
-# and a leading `branches` would otherwise swallow `branches-ignore`.
+# pull request.
 #
 # `tags`/`tags-ignore` are absent deliberately: a tag filter does not change
 # whether a *branch* is covered, which is the only question here.
+#
+# Longest-first is a habit here, not a requirement, and it was worth checking
+# rather than asserting: the alternation is first-match-wins, so `branches` tried
+# against `branches-ignore:` does match — and then the `:` that follows the group
+# fails against the `-`, the engine backtracks into the alternation, and
+# `branches-ignore` wins on the retry. Both orders classify all four keys
+# identically. The order would begin to matter if the group were ever matched
+# without that anchor after it, which is the only reason to leave it this way.
 _FILTER_KEYS = ("branches-ignore", "branches", "paths-ignore", "paths")
+
+# The top-level `on:` key. The key itself may be quoted: YAML 1.1 reads a bare
+# `on` as the boolean true, and a repo bitten by that writes `"on":` instead.
+_ON_KEY = re.compile(r"^[\"']?on[\"']?\s*:\s*(.*)$")
+
+# An event under a block `on:`. What follows the colon is captured rather than
+# required to be empty — an event written inline is still an event, and saying
+# so is the difference between "unreadable" and "absent".
+_EVENT_KEY = re.compile(r"^  [\"']?([A-Za-z_]+)[\"']?\s*:\s*(.*)$")
+
+# A commented-out event key: at the event indent, and a bare key with nothing
+# after the colon. Deliberately not every comment — see `_trigger_branches`.
+_COMMENTED_EVENT = re.compile(r"^  #+\s*[\"']?[A-Za-z_]+[\"']?\s*:\s*$")
+
+
+def _on_shorthand(value: str) -> dict[str, list[str] | None]:
+    """
+    ``{event: None}`` for the two shorthand forms of ``on:``.
+
+    ``on: [push, pull_request]`` and ``on: push`` name their events and carry no
+    filter — and here that is *provable* rather than lenient, which is why they
+    resolve to ``None`` and pass rather than to ``[]`` and fail. Neither
+    shorthand has anywhere to put a branch filter; the syntax that would express
+    one is the block form.
+
+    Anything else is refused. The shape that matters is the flow mapping,
+    ``on: {pull_request: {branches: [main]}}``, which *can* carry a filter: it
+    would have to be read out of nested braces by a parser that stops at
+    indentation, and a filter this failed to see would read as absent and pass.
+    """
+    if re.fullmatch(r"\[(.*)\]", value):
+        names = [item.strip().strip("'\"") for item in value[1:-1].split(",") if item.strip()]
+    else:
+        names = [value.strip("'\"")]
+
+    if not names or any(not re.fullmatch(r"[A-Za-z_]+", name) for name in names):
+        raise ValueError(
+            f"`on:` is written as {value!r}, which this parser does not read.\n"
+            "The shorthands `on: push` and `on: [push, pull_request]` are read, "
+            "because neither can carry a branch filter. A flow mapping can, so "
+            "it is refused rather than guessed at — write `on:` as a block."
+        )
+    return {name: None for name in names}
 
 
 def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
@@ -270,15 +320,50 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     absent and passes. That is the cost of ``None`` existing at all. It is
     bounded by the filter names being a closed, stable set, and it is why they
     are matched by *name* at any indent rather than by position.
+
+    **The shapes ``on:`` itself takes are read, not skipped.** ``on: push`` and
+    ``on: [push, pull_request]`` resolve to their events with no filter;
+    ``on: {…}`` is refused; ``"on":`` is the same key as ``on:``. All of them
+    used to fall through a search for a bare ``on:`` line, leaving it empty and
+    the guard reporting that the workflow "declares no ``on.pull_request``
+    trigger at all" — a true-sounding message that sends the reader to add a
+    trigger the file already has. An event written inline
+    (``pull_request: {branches: [main]}``) is registered and marked unproven for
+    the same reason: absent and unreadable are different answers, and the message
+    a person reads has to say which one this is.
+
+    **A commented-out event key ends the event it commented out.** Anything left
+    indented under it is orphaned, and reading those keys as the *previous*
+    event's filter is how a workflow filtered to ``develop`` reported ``main``
+    and passed — the misattribution is silent when the commented event is not one
+    of the two asserted below. Only a comment at the event indent whose content
+    is a bare key counts, so a note above a filter is left alone. The residual is
+    a comment of exactly that shape — ``  # TODO:`` — sitting between an event
+    and its filter, which hides the filter and reads as unfiltered.
     """
     filters: dict[str, list[str] | None] = {}
     unproven: set[str] = set()
     lines = workflow.read_text(encoding="utf-8").splitlines()
 
-    try:
-        start = next(i for i, line in enumerate(lines) if line.rstrip() == "on:")
-    except StopIteration:  # pragma: no cover - asserted directly below
+    header = start = None
+    for index, line in enumerate(lines):
+        if not line.startswith((" ", "\t")):
+            header = _ON_KEY.match(line)
+            if header:
+                start = index
+                break
+    if header is None:  # pragma: no cover - asserted directly below
         return filters
+
+    shorthand = _strip_comment(header.group(1))
+    if shorthand:
+        # A refusal propagates and fails the suite, as it does for a `name:`
+        # this cannot read: an `on:` block this cannot read is a filter it cannot
+        # check, and passing would mean vouching for one it never saw.
+        try:
+            return _on_shorthand(shorthand)
+        except ValueError as exc:
+            raise ValueError(f"{workflow}: {exc}") from None
 
     key_pattern = re.compile(
         r"^\s{3,}[\"']?(" + "|".join(_FILTER_KEYS) + r")[\"']?\s*:\s*(.*)$"
@@ -286,14 +371,31 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
 
     current: str | None = None
     for line in lines[start + 1:]:
-        if not line.strip() or line.lstrip().startswith("#"):
+        if not line.strip():
+            continue
+        if line.lstrip().startswith("#"):
+            # Forgetting the current event is the whole of the fix: the keys
+            # below a commented-out one belong to nothing, and attributing them
+            # to the event above is worse than dropping them, because the event
+            # above is real and its filter is then reported as something it is
+            # not.
+            if _COMMENTED_EVENT.match(line):
+                current = None
             continue
         if not line.startswith(" "):
             break
-        event = re.match(r"^  ([A-Za-z_]+):\s*$", line)
+        event = _EVENT_KEY.match(line)
         if event:
             current = event.group(1)
             filters.setdefault(current, None)  # no filter seen yet
+            # `pull_request:` and `pull_request: null` are the same event with
+            # no filters — the null tokens as `_scalar` reads them. Anything
+            # else after the colon is a value this does not parse, most likely a
+            # flow mapping, and an event whose filter cannot be read is unproven
+            # rather than unfiltered.
+            inline_value = _strip_comment(event.group(2))
+            if inline_value and inline_value not in ("~", "null", "Null", "NULL"):
+                unproven.add(current)
             continue
         if current is None:
             continue
@@ -710,6 +812,81 @@ class TestGuardIsNotVacuous:
                 f"on:\n  pull_request:\n{filter_line}\njobs:\n", encoding="utf-8"
             )
             assert _trigger_branches(workflow) == {"pull_request": ["develop"]}, label
+
+    def test_the_shorthand_forms_of_on_are_read(self, tmp_path):
+        # Neither shorthand can carry a branch filter, so `None` here is proved
+        # rather than assumed. Skipping them instead reported "declares no
+        # `on.pull_request` trigger at all" on a workflow that declares one —
+        # the reader is then sent to add a trigger that is already there, and
+        # the guard is the thing that is wrong.
+        shapes = {
+            "on: [push, pull_request]\njobs:\n": {"push": None, "pull_request": None},
+            "on: pull_request\njobs:\n": {"pull_request": None},
+            '"on": [pull_request]\njobs:\n': {"pull_request": None},
+            "on: [push]  # everything\njobs:\n": {"push": None},
+        }
+        for text, expected in shapes.items():
+            workflow = tmp_path / "w.yml"
+            workflow.write_text(text, encoding="utf-8")
+            assert _trigger_branches(workflow) == expected, text
+
+    def test_an_on_block_this_parser_cannot_read_is_refused(self, tmp_path):
+        # A flow mapping is the one shorthand that *can* carry a filter, so it
+        # is the one that must not be guessed at. Loud, like a block-scalar
+        # `name:`: silently reading no filter out of a workflow that has one is
+        # exactly the fail-open direction `None` opened up.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on: {pull_request: {branches: [develop]}}\njobs:\n", encoding="utf-8"
+        )
+        with pytest.raises(ValueError):
+            _trigger_branches(workflow)
+
+    def test_an_event_written_inline_is_unproven_rather_than_absent(self, tmp_path):
+        # One level down from the case above and the same distinction: the event
+        # is declared, so reporting it missing is false. It is its filter that
+        # cannot be read, which is `[]` — the answer that fails.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request: {branches: [main]}\n"
+            "  push:  # nothing after the colon is still no filter\n"
+            "  schedule: null\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {
+            "pull_request": [], "push": None, "schedule": None,
+        }
+
+    def test_a_commented_out_event_does_not_lend_its_filter_to_the_one_above(self, tmp_path):
+        # The keys under a commented-out event are orphaned. Attributing them to
+        # the event above reported `pull_request` as filtered to `main` when its
+        # own filter says `develop` — and passed. The commented event is absent
+        # either way; what this fixes is the answer given for the live one.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request:\n"
+            "    branches: [develop]\n"
+            "  # workflow_run:\n"
+            "    branches: [main]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {"pull_request": ["develop"]}
+
+    def test_an_ordinary_comment_does_not_end_the_event(self, tmp_path):
+        # The other half: only a bare key at the event indent counts. A note
+        # above a filter, or one carrying a sentence, must leave the filter
+        # attached — dropping it would read as unfiltered, which passes.
+        for note in ("    # only the pivot", "  # TODO: restore the other one"):
+            workflow = tmp_path / "w.yml"
+            workflow.write_text(
+                f"on:\n  pull_request:\n{note}\n    branches: [main]\njobs:\n",
+                encoding="utf-8",
+            )
+            assert _trigger_branches(workflow) == {"pull_request": ["main"]}, note
 
     def test_an_unreadable_filter_beats_a_readable_one_on_the_same_event(self, tmp_path):
         # Order-independence, asserted in both directions. An event filtered by

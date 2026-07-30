@@ -180,7 +180,7 @@ class TestTheGuardPasses:
              "-q", "--no-header", "--collect-only", "-p", "no:cacheprovider"],
             capture_output=True, text=True,
         )
-        assert "25 tests collected" in result.stdout, result.stdout[-600:]
+        assert "30 tests collected" in result.stdout, result.stdout[-600:]
 
     def test_the_readme_states_the_right_number_of_mutations(self):
         # README.md quotes this count in prose. The stale `# 48 tests` it used to
