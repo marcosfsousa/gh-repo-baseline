@@ -117,11 +117,37 @@ class RulesetsUnavailable(Exception):
     """
 
 
+# The rulesets endpoints, matched by shape rather than by substring.
+#
+# `"rulesets" in path` also matches `repos/OWNER/rulesets` -- the plain repository
+# GET for a repo that happens to be named `rulesets`. That call is made from
+# step_repo_settings, outside the try/except in main that exists to handle this
+# exception, so raising there is an uncaught traceback rather than the [skip] it
+# was meant to produce.
+#
+# Suffix matching does not separate the two: `repos/OWNER/rulesets` and
+# `repos/OWNER/REPO/rulesets` both end in `/rulesets`. The segment count is what
+# distinguishes them, so the whole shape is matched. The optional trailing id is
+# the by-id read in _find_ruleset and the PUT that updates one.
+_RULESETS_ENDPOINT = re.compile(r"repos/[^/]+/[^/]+/rulesets(?:/\d+)?")
+
+
+def _raise_if_plan_gated(path: str, err: str) -> None:
+    """
+    Translate the plan/visibility 403 into ``RulesetsUnavailable``.
+
+    Called on reads *and* writes. Detecting it on reads alone leaves the case
+    where the list endpoint answers but the write is refused: the run exits 1
+    with a raw 403 instead of the [skip] and exit 2 that say what to do about it.
+    """
+    if _RULESETS_ENDPOINT.fullmatch(path) and "Upgrade to GitHub Pro" in err:
+        raise RulesetsUnavailable(err.strip())
+
+
 def _gh_json(path: str) -> object:
     code, out, err = _gh([path])
     if code != 0:
-        if "rulesets" in path and "Upgrade to GitHub Pro" in err:
-            raise RulesetsUnavailable(err.strip())
+        _raise_if_plan_gated(path, err)
         sys.exit(f"gh api {path} failed:\n{err.strip()}")
     return json.loads(out)
 
@@ -150,6 +176,71 @@ def _status(path: str) -> int:
 def _strip_comment(value: str) -> str:
     """YAML comment rule: `#` opens a comment at line start or after whitespace."""
     return re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip()
+
+
+def _scalar(value: str) -> str | None:
+    """
+    What a job's ``name:`` denotes, or ``None`` when it denotes nothing and the
+    job id stands as the context.
+
+    Stripping comments unconditionally is wrong for three shapes, and wrong here
+    is silent: a context that does not match what the job reports never arrives,
+    and a rule waiting on a check that never arrives leaves the pull request
+    pending rather than red.
+
+    ``name: 'Build #1'``
+        A quoted scalar. ``#`` opens a comment only outside quotes, so the value
+        is read to its closing quote instead of truncated at the hash -- which
+        would derive ``Build`` and require a check nothing reports.
+
+    ``name:`` followed only by a comment
+        Denotes null, and GitHub falls back to the job id. ``None`` says so, and
+        leaves the id the caller already recorded in place. A bare ``name:`` with
+        nothing after it already behaved this way; this makes the two agree
+        rather than deriving an empty context from one of them.
+
+    ``name: >`` / ``name: |``
+        A block scalar, whose value is on the lines below. Refused rather than
+        folded: correct folding means chomping indicators, indent indicators and
+        blank-line rules, in two copies of this parser that no test can prove
+        right -- only prove equal. A job name is a one-line label, so the shape is
+        vanishingly rare and stopping costs nothing.
+
+    Raised as ``ValueError`` rather than exiting, because the copy of this in the
+    guard template is a test and has no process to exit. Each caller says what to
+    do about it.
+    """
+    value = value.strip()
+
+    if re.match(r"[|>][+-]?\d*(?:\s|$)", value):
+        raise ValueError(
+            f"`name:` is a block scalar ({value.split()[0]!r}), whose value is on "
+            "the lines below it.\nThis parser reads one-line names only. Write "
+            "the name inline, or pass the context explicitly with --check."
+        )
+
+    if value.startswith("'"):
+        # `''` is how YAML escapes a quote inside a single-quoted scalar, so the
+        # closing quote is the first one that is not doubled.
+        match = re.match(r"'((?:[^']|'')*)'", value)
+        if not match:
+            raise ValueError(
+                f"`name:` opens with a quote it never closes: {value!r}.\n"
+                "There is no value to read."
+            )
+        return match.group(1).replace("''", "'") or None
+
+    if value.startswith('"'):
+        match = re.match(r'"([^"\\]*)"', value)
+        if not match:
+            raise ValueError(
+                f"`name:` is a double-quoted scalar this parser cannot read: "
+                f"{value!r}.\nBackslash escapes and unterminated quotes are "
+                "refused rather than guessed at."
+            )
+        return match.group(1) or None
+
+    return _strip_comment(value) or None
 
 
 def _job_contexts(workflow: Path) -> list[str]:
@@ -192,7 +283,14 @@ def _job_contexts(workflow: Path) -> list[str]:
             continue
         name = re.match(r"^    name:\s*(.+)$", line)
         if name and current:
-            contexts[current] = _strip_comment(name.group(1)).strip("'\"")
+            try:
+                scalar = _scalar(name.group(1))
+            except ValueError as exc:
+                sys.exit(f"{workflow}, job {current!r}: {exc}")
+            # None means the name denotes nothing, so the job id already recorded
+            # above stands -- which is what GitHub reports for such a job.
+            if scalar is not None:
+                contexts[current] = scalar
 
     if not contexts:
         sys.exit(
@@ -370,17 +468,29 @@ def step_ruleset(repo: str, branch: str, contexts: list[str], report: Reporter) 
         return
 
     if existing:
-        report.did(f"ruleset {branch!r} -> updated (id {existing['id']})")
-        args = ["-X", "PUT", f"repos/{repo}/rulesets/{existing['id']}"]
+        what = f"ruleset {branch!r} -> updated (id {existing['id']})"
+        path = f"repos/{repo}/rulesets/{existing['id']}"
+        method = "PUT"
     else:
-        report.did(f"ruleset {branch!r} -> created")
-        args = ["-X", "POST", f"repos/{repo}/rulesets"]
+        what = f"ruleset {branch!r} -> created"
+        path = f"repos/{repo}/rulesets"
+        method = "POST"
 
     if report.dry_run:
+        # A dry run reaches here having only read, so it cannot prove the write
+        # would be permitted -- see the note on --dry-run in main.
+        report.did(what)
         return
-    code, _, err = _gh([*args, "--input", "-"], body=json.dumps(desired))
+
+    code, _, err = _gh(["-X", method, path, "--input", "-"], body=json.dumps(desired))
     if code != 0:
+        _raise_if_plan_gated(path, err)
         sys.exit(f"Could not apply the ruleset:\n{err.strip()}")
+
+    # Reported only once the write has landed. Reporting before it meant a
+    # refused write printed `[set] ruleset created` and then died -- a claim that
+    # the thing happened, one line above the error saying it had not.
+    report.did(what)
 
 
 # -- entry point --------------------------------------------------------------
@@ -410,7 +520,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="report what would change and write nothing",
+        help="report what would change and write nothing. Performs only GETs, so "
+             "it reports what the API permits reading -- a repo whose ruleset "
+             "list reads but whose writes are refused still reports pending "
+             "changes here",
     )
     args = parser.parse_args()
 

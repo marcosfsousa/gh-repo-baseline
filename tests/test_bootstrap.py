@@ -14,6 +14,7 @@ would send the right body. Use ``--dry-run`` against a real repo for the other
 half; it performs only GETs.
 """
 
+import ast
 import json
 
 import pytest
@@ -92,6 +93,72 @@ class TestJobContexts:
         workflow.write_text("jobs:\n\npermissions:\n  contents: read\n", encoding="utf-8")
         with pytest.raises(SystemExit):
             boot._job_contexts(workflow)
+
+    def test_a_name_this_parser_refuses_exits_naming_the_job(self, boot, tmp_path):
+        # The refusal has to identify the job, or a person reading it has to find
+        # the offending line themselves in a workflow that may have many.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text("jobs:\n  folded:\n    name: >\n      A name\n", encoding="utf-8")
+        with pytest.raises(SystemExit, match="folded"):
+            boot._job_contexts(workflow)
+
+
+class TestScalarNames:
+    """
+    The shapes a plain comment-strip gets wrong.
+
+    All three fail *silently* without this: the derived context does not match
+    what the job reports, so the required check never arrives and the pull request
+    sits pending rather than red. Handled where the right answer is cheap and
+    unambiguous, refused where it is neither — see the docstring on ``_scalar``.
+    """
+
+    def test_a_hash_inside_quotes_is_not_a_comment(self, boot):
+        # The finding that motivated this: `#` opens a comment only outside
+        # quotes, and truncating here derives `Build` for a job reporting
+        # `Build #1` — a required check nothing ever reports.
+        assert boot._scalar("'Build #1'") == "Build #1"
+        assert boot._scalar('"Build #1"') == "Build #1"
+
+    def test_a_hash_outside_quotes_still_opens_a_comment(self, boot):
+        assert boot._scalar("UI tests (Playwright)  # the slow one") == "UI tests (Playwright)"
+
+    def test_a_doubled_quote_is_an_escaped_quote(self, boot):
+        # YAML's escape inside a single-quoted scalar. Taking the first quote as
+        # the terminator would derive `Bob`.
+        assert boot._scalar("'Bob''s job'") == "Bob's job"
+
+    def test_trailing_comments_after_a_quoted_scalar_are_dropped(self, boot):
+        assert boot._scalar("'Build #1'  # still a comment") == "Build #1"
+
+    def test_a_name_that_denotes_nothing_falls_back_to_the_job_id(self, boot, tmp_path):
+        # `name:` followed only by a comment is null in YAML, so GitHub reports
+        # the job id. Deriving an empty context instead would send
+        # `{"context": ""}` — a required check no job can ever report.
+        assert boot._scalar("# just a comment") is None
+        assert boot._scalar("''") is None
+        workflow = tmp_path / "w.yml"
+        workflow.write_text("jobs:\n  build:\n    name: # replaced later\n", encoding="utf-8")
+        assert boot._job_contexts(workflow) == ["build"]
+
+    @pytest.mark.parametrize("value", ["|", ">", ">-", "|+", "|2", "> # c"])
+    def test_block_scalars_are_refused(self, boot, value):
+        # Refused rather than folded: correct folding is chomping and indent
+        # indicators and blank-line rules, duplicated across two copies of this
+        # parser that no test can prove right — only prove equal.
+        with pytest.raises(ValueError, match="block scalar"):
+            boot._scalar(value)
+
+    def test_a_greater_than_inside_a_name_is_not_a_block_scalar(self, boot):
+        # The refusal keys on the indicator shape, not on the character.
+        assert boot._scalar("Backend > frontend") == "Backend > frontend"
+        assert boot._scalar("|pipe| in a name") == "|pipe| in a name"
+
+    def test_unreadable_quoting_is_refused_rather_than_guessed_at(self, boot):
+        with pytest.raises(ValueError, match="never closes"):
+            boot._scalar("'unterminated")
+        with pytest.raises(ValueError, match="cannot read"):
+            boot._scalar('"a \\" escape"')
 
 
 class TestBothParserCopiesAgree:
@@ -284,30 +351,129 @@ class TestPlanAndVisibilityGating:
         with pytest.raises(SystemExit):
             boot._gh_json("repos/o/r")
 
+    def test_a_repo_named_rulesets_is_not_mistaken_for_the_endpoint(self, boot, monkeypatch):
+        # `"rulesets" in path` matched the plain repository GET for this repo.
+        # That call is made from step_repo_settings, outside the try/except in
+        # main that handles this exception, so it surfaced as a traceback rather
+        # than the [skip] it was meant to produce.
+        monkeypatch.setattr(boot, "_gh", lambda *a, **k: (1, "", self.PRO_403))
+        with pytest.raises(SystemExit):
+            boot._gh_json("repos/o/rulesets")
+
+    def test_the_by_id_endpoint_is_still_recognised(self, boot, monkeypatch):
+        # _find_ruleset re-reads the one match in full, and the update is a PUT to
+        # the same path. Both are gated the same way.
+        monkeypatch.setattr(boot, "_gh", lambda *a, **k: (1, "", self.PRO_403))
+        with pytest.raises(boot.RulesetsUnavailable):
+            boot._gh_json("repos/o/r/rulesets/123")
+
+    def test_the_gate_is_detected_on_the_write_too(self, boot, monkeypatch):
+        # Detecting it on reads alone leaves the case where the list endpoint
+        # answers but the write is refused: exit 1 with a raw 403, instead of the
+        # [skip] and exit 2 that say what to do about it.
+        monkeypatch.setattr(boot, "_find_ruleset", lambda repo, name: None)
+        monkeypatch.setattr(boot, "_gh", lambda *a, **k: (1, "", self.PRO_403))
+        with pytest.raises(boot.RulesetsUnavailable):
+            boot.step_ruleset("o/r", "main", ["X"], boot.Reporter(dry_run=False))
+
+    def test_a_refused_write_does_not_report_success_first(self, boot, monkeypatch, capsys):
+        # The report line used to be printed before the write was attempted, so a
+        # refusal printed `[set] ruleset created` and then died — a claim that the
+        # thing happened, one line above the error saying it had not.
+        monkeypatch.setattr(boot, "_find_ruleset", lambda repo, name: None)
+        monkeypatch.setattr(boot, "_gh", lambda *a, **k: (1, "", "gh: Not Found (HTTP 404)"))
+        report = boot.Reporter(dry_run=False)
+        with pytest.raises(SystemExit):
+            boot.step_ruleset("o/r", "main", ["X"], report)
+        assert "[set]" not in capsys.readouterr().out
+        assert report.changed == 0
+
+
+_OUTPUT_CALLS = {"print", "sys.exit", "parser.error"}
+
+
+def _called_name(func) -> str | None:
+    """``print``, ``sys.exit``, ``parser.error`` — the dotted form, or None."""
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return f"{func.value.id}.{func.attr}"
+    return None
+
+
+def _non_ascii_in_output(source: str) -> set[str]:
+    """
+    Every non-ASCII character in a string that reaches a call writing to a stream.
+
+    Walks the AST rather than matching source text. The regex this replaced was
+    ``(print|sys\\.exit|parser\\.error)\\((.*?)\\n?\\)`` — non-greedy, so it
+    stopped at the *first* ``)`` in the call and scanned about a tenth of the
+    file. The plan-gating message it was written for contains
+    ``(gh repo edit --visibility public)``, so everything after that line in the
+    very print statement whose em dash caused the original bug went unread. A
+    guard that does not cover its own regression is not a regression test.
+
+    Docstrings and comments stay exempt for free: a comment is not in the tree at
+    all, and a docstring is a bare expression rather than an argument to a call.
+    f-strings are covered, which the regex managed only by accident.
+    """
+    offenders: set[str] = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call) or _called_name(node.func) not in _OUTPUT_CALLS:
+            continue
+        for child in ast.walk(node):
+            if isinstance(child, ast.Constant) and isinstance(child.value, str):
+                offenders |= {c for c in child.value if ord(c) > 127}
+    return offenders
+
 
 class TestOutputIsConsoleSafe:
+    """
+    Every string this script prints must be ASCII.
+
+    Windows consoles default to a legacy code page, and a non-ASCII character in
+    printed output is mangled at best and a ``UnicodeEncodeError`` at worst — from
+    a tool whose whole job is to report clearly what it did and did not change. An
+    em dash in the plan-gating message did exactly that.
+    """
 
     def test_printed_strings_are_ascii(self):
-        """
-        Every string this script prints must be ASCII.
-
-        Windows consoles default to a legacy code page, and a non-ASCII character
-        in printed output is mangled at best and a ``UnicodeEncodeError`` at
-        worst — from a tool whose whole job is to report clearly what it did and
-        did not change. An em dash in the plan-gating message did exactly that.
-
-        Docstrings and comments are exempt: they are never written to a stream.
-        """
-        import re
-
-        source = (REPO_ROOT / "scripts" / "bootstrap-repo.py").read_text(encoding="utf-8")
-        offenders = set()
-        for match in re.finditer(r"(print|sys\.exit|parser\.error)\((.*?)\n?\)", source, re.DOTALL):
-            offenders |= {c for c in match.group(2) if ord(c) > 127}
+        offenders = _non_ascii_in_output(
+            (REPO_ROOT / "scripts" / "bootstrap-repo.py").read_text(encoding="utf-8")
+        )
         assert not offenders, (
             "non-ASCII characters in printed output: "
             + ", ".join(f"{c!r} ({hex(ord(c))})" for c in sorted(offenders))
         )
+
+    def test_the_detector_reads_past_the_first_paren(self):
+        # The exact shape the old regex missed: a parenthesised aside early in a
+        # multi-line print, and the offending character after it.
+        source = (
+            "def f():\n"
+            "    print(\n"
+            '        "  make the repository public "\n'
+            '        "(gh repo edit --visibility public)\\n"\n'
+            '        "  everything above this line — applied\\n"\n'
+            "    )\n"
+        )
+        assert _non_ascii_in_output(source) == {"—"}
+
+    def test_docstrings_and_comments_stay_exempt(self):
+        source = (
+            'def f():\n'
+            '    """A docstring — never written to a stream."""\n'
+            '    # A comment — likewise.\n'
+            '    value = "not printed — either"\n'
+            '    print("clean")\n'
+        )
+        assert _non_ascii_in_output(source) == set()
+
+    def test_f_strings_are_covered(self):
+        assert _non_ascii_in_output('print(f"{x} — y")') == {"—"}
+
+    def test_calls_that_do_not_write_are_ignored(self):
+        assert _non_ascii_in_output('log.info("—")') == set()
 
 
 class TestContextsAreDedupedInOrder:
