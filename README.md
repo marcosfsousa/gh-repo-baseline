@@ -43,6 +43,28 @@ Every step is idempotent and reports `[ok]` or `[set]`, so re-running is how you
 correct drift rather than something to avoid. There is no bootstrap window this
 has to land inside.
 
+### Rulesets need a public repo or a paid plan
+
+The hard constraint, found the first time this was pointed at a private repo:
+**on a free personal account, a private repository can have no branch protection
+at all** — not a ruleset, not a classic protected branch. Both are gated by plan
+*and* visibility. The API answers:
+
+```
+403  Upgrade to GitHub Pro or make this repository public to enable this feature.
+```
+
+This is not a token or scope problem, and adding scopes will not fix it. Three
+ways forward: make the repo public, upgrade the plan, or pass `--no-ruleset` to
+say out loud that the branch is unprotected.
+
+The tool relays this as a `[skip]` with the explanation, applies everything else,
+and **exits 2** — a bootstrap tool that exits 0 on an unprotected branch is how a
+repo ends up looking configured while anyone can push to its default branch.
+
+Worth knowing before you plan a rollout: this splits your repos into two classes,
+and it is visibility, not importance, that decides which.
+
 ### What it sets
 
 - `delete_branch_on_merge`

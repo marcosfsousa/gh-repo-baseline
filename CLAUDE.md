@@ -83,9 +83,19 @@ Not public: nothing in it is secret, but it encodes how these repos are protecte
 and the templates still carry `REPLACE-` placeholders. Going public is a decision
 to ask about, not a default.
 
-`main` is protected by the baseline's own ruleset with `Tests (pytest)` as the
-required check, so work goes through a PR. The root commit was pushed directly —
-there was no base to open a PR against.
+**`main` is NOT protected, and cannot be while the repo is private.** Rulesets are
+gated by plan and visibility together: on a free personal account a private repo
+can have neither a ruleset nor a classic protected branch. `.github/rulesets/main.json`
+is committed and correct — it is the record and the body that would be applied —
+but nothing enforces it.
+
+So `Tests (pytest)` runs on every PR and can go red without blocking a merge. Treat
+the discipline as manual until the repo goes public or the plan changes: read CI
+before merging, because nothing will stop you.
+
+`delete_branch_on_merge` and both Dependabot toggles *were* applied — those are
+not plan-gated. The root commit was pushed directly, since there was no base to
+open a PR against.
 
 ## Verifying a change to bootstrap-repo.py
 

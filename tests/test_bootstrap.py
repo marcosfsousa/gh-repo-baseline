@@ -250,6 +250,66 @@ class TestComparisonIsOrderInsensitive:
         assert boot._settable(body) == boot._settable(live)
 
 
+class TestPlanAndVisibilityGating:
+    """
+    Rulesets are gated by plan *and* visibility, which is easy to misread as a
+    permissions problem and then chase with scopes that will never help.
+
+    A private repo on a free personal account can have neither a ruleset nor a
+    classic protected branch. The 403 says "Upgrade to GitHub Pro or make this
+    repository public", and the tool has to relay that rather than the raw error.
+    """
+
+    PRO_403 = (
+        "gh: Upgrade to GitHub Pro or make this repository public to enable "
+        "this feature. (HTTP 403)"
+    )
+
+    def test_the_gating_403_is_recognised(self, boot, monkeypatch):
+        monkeypatch.setattr(boot, "_gh", lambda *a, **k: (1, "", self.PRO_403))
+        with pytest.raises(boot.RulesetsUnavailable):
+            boot._gh_json("repos/o/r/rulesets")
+
+    def test_other_ruleset_failures_are_not_swallowed(self, boot, monkeypatch):
+        # A real error must still stop the run. Treating every ruleset 4xx as
+        # "unavailable by plan" would report an unprotected branch as expected.
+        monkeypatch.setattr(boot, "_gh", lambda *a, **k: (1, "", "gh: Not Found (HTTP 404)"))
+        with pytest.raises(SystemExit):
+            boot._gh_json("repos/o/r/rulesets")
+
+    def test_the_same_403_elsewhere_is_not_reinterpreted(self, boot, monkeypatch):
+        # Scoped to the rulesets endpoint. The message is specific to it, and a
+        # 403 on repo settings means something else entirely.
+        monkeypatch.setattr(boot, "_gh", lambda *a, **k: (1, "", self.PRO_403))
+        with pytest.raises(SystemExit):
+            boot._gh_json("repos/o/r")
+
+
+class TestOutputIsConsoleSafe:
+
+    def test_printed_strings_are_ascii(self):
+        """
+        Every string this script prints must be ASCII.
+
+        Windows consoles default to a legacy code page, and a non-ASCII character
+        in printed output is mangled at best and a ``UnicodeEncodeError`` at
+        worst — from a tool whose whole job is to report clearly what it did and
+        did not change. An em dash in the plan-gating message did exactly that.
+
+        Docstrings and comments are exempt: they are never written to a stream.
+        """
+        import re
+
+        source = (REPO_ROOT / "scripts" / "bootstrap-repo.py").read_text(encoding="utf-8")
+        offenders = set()
+        for match in re.finditer(r"(print|sys\.exit|parser\.error)\((.*?)\n?\)", source, re.DOTALL):
+            offenders |= {c for c in match.group(2) if ord(c) > 127}
+        assert not offenders, (
+            "non-ASCII characters in printed output: "
+            + ", ".join(f"{c!r} ({hex(ord(c))})" for c in sorted(offenders))
+        )
+
+
 class TestContextsAreDedupedInOrder:
 
     def test_duplicates_collapse_and_order_is_preserved(self, boot, tmp_path):

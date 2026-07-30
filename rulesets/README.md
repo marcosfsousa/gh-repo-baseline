@@ -93,6 +93,26 @@ so a ruleset deleted and recreated — which is how a bad one gets rolled back �
 comes back with a different one, and a remembered id then updates a ruleset that
 no longer exists, or a different one that does.
 
+## Whether you can use this at all
+
+Rulesets are gated by **plan and visibility together**, which is the first thing
+to check when this file appears not to work:
+
+| | free personal account | GitHub Pro |
+|---|---|---|
+| public repo | rulesets work | rulesets work |
+| private repo | **nothing available** | rulesets work |
+
+The bottom-left cell is absolute — a private repo on a free account can have no
+ruleset and no classic protected branch either. The 403 reads "Upgrade to GitHub
+Pro or make this repository public", which is a statement about the plan, not
+about the token, so re-authenticating or widening scopes achieves nothing.
+
+The consequence for a rollout is worth sitting with: on a free account it is a
+repo's *visibility* that decides whether it can be protected, not how much the
+protection matters. A private repo holding something sensitive is precisely the
+one that cannot have a gate.
+
 ## If the repos are in an organization
 
 Stop using this. Org-level rulesets target many repositories at once by name
