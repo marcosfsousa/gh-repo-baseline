@@ -1,0 +1,9 @@
+# The whole dependency set. scripts/bootstrap-repo.py imports nothing outside the
+# standard library and shells out to `gh`, deliberately — a tool for bootstrapping
+# repos should not need its own bootstrapping.
+#
+# So this file exists for the test suite alone, and pinned rather than floating
+# for one specific reason: tests/test_guard.py asserts an exact collected-test
+# count and parses pytest's `FAILED` output lines. Both are pytest's presentation
+# rather than its contract, and a minor release is free to change either.
+pytest==9.1.1

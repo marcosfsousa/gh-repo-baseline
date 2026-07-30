@@ -49,16 +49,52 @@ to look for it in their own history.
 Do not add issue references to this repo's own files either. Nothing here has an
 issue tracker yet.
 
-## Templates are not collected by pytest
+## The guard exists twice. Edit the template.
 
-`pytest.ini` excludes `templates/`. Files under it resolve `.github` paths
-relative to their own grandparent, which is only a repo root after they have been
-copied out. A bare `pytest` here would collect the guard test and fail on paths
-that were never meant to exist.
+`templates/tests/test_required_checks.py` is the copyable one.
+`tests/test_required_checks.py` is the live copy guarding this repo's own
+ruleset — the baseline applied to itself.
 
-If you add a real test suite, it goes in `tests/` at the root, not under
-`templates/`.
+They are byte-identical below their headers, and
+`TestTheLiveGuardMatchesTheTemplate` in `tests/test_guard.py` enforces it. The
+drift is asymmetric and that is why it is a test: a fix applied only to the live
+copy leaves this repo green while shipping the broken version to every repo that
+copies the template.
 
-## No remote yet
+So the order is always **edit the template, re-copy over the live one, restore
+only the header**.
 
-Local git only, by decision. Do not `gh repo create` or push without being asked.
+`pytest.ini` excludes `templates/` from collection. Files under it resolve
+`.github` paths relative to their own grandparent, which is a repo root only after
+they have been copied out.
+
+## The parser exists twice too
+
+`scripts/bootstrap-repo.py` and the guard both parse workflow job names by
+indentation. The template cannot import from `scripts/`, because it gets copied
+into repos that have no `scripts/`. `TestBothParserCopiesAgree` holds them to the
+same answer on the same input, including on this repo's real `ci.yml`. Only the
+parsing must match — the return types differ deliberately.
+
+## Remote
+
+`https://github.com/marcosfsousa/gh-repo-baseline`, private, created 2026-07-30.
+Not public: nothing in it is secret, but it encodes how these repos are protected
+and the templates still carry `REPLACE-` placeholders. Going public is a decision
+to ask about, not a default.
+
+`main` is protected by the baseline's own ruleset with `Tests (pytest)` as the
+required check, so work goes through a PR. The root commit was pushed directly —
+there was no base to open a PR against.
+
+## Verifying a change to bootstrap-repo.py
+
+The suite is offline and covers only the pure part: the parser, the ruleset body,
+the comparison. It never exercises the `gh` wrappers, so a green run does not
+prove the script can authenticate or that the endpoints still exist.
+
+The other half is a read-only `--dry-run` against a real repo, which performs
+only GETs. Against a repo already configured to the baseline it must print
+`Nothing to change.` — if it reports a pending ruleset update on a repo that
+already matches, that is the order-insensitivity bug in `_canonical`, and
+`TestComparisonIsOrderInsensitive` is the regression test for it.

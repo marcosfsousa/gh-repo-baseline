@@ -1,0 +1,66 @@
+# This repo's own gate. One seam, so one job.
+#
+# The job `name:` below is the status-check identifier branch protection matches,
+# and it matches by string — see templates/ci.yml for the full argument, and
+# tests/test_required_checks.py for the guard that holds this name and
+# .github/rulesets/main.json's required context equal in both directions. Rename
+# the job here and the backend suite fails rather than the branch silently
+# unprotecting itself.
+#
+# No secrets, and here that is structural rather than a discipline: nothing in
+# this suite touches the network. tests/test_bootstrap.py exercises the pure part
+# of scripts/bootstrap-repo.py — the parser, the ruleset body, the comparison —
+# and never the `gh` wrappers. So a green run does not prove the script can
+# authenticate or that the endpoints still exist. `--dry-run` against a real repo
+# is the other half of that, and it stays a manual step because it needs admin
+# credentials this workflow should not have.
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Supersede a running build when a PR gets a new commit; never cancel a run on
+# main, so every commit on the baseline keeps its own verdict.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    # The suite is seconds; the budget is dependency install plus the nested
+    # pytest sessions tests/test_guard.py spawns. Anything past this is stuck.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      # No runtime downstream to match — nothing here is deployed — so this is
+      # picked rather than derived. 3.11 is the floor the scripts actually need
+      # (`str | None` annotations are 3.10+) with room above it.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      # Discovery over tests/, never an enumerated list, so a new test file
+      # cannot be silently omitted. pytest.ini declares testpaths, so a bare
+      # `pytest` here and locally collect the same set.
+      #
+      # tests/test_guard.py runs pytest inside pytest, in a subprocess against a
+      # temp directory. That is deliberate: what it asserts is a test session's
+      # verdict, which is not something a function call returns.
+      - name: Run pytest
+        run: pytest -v --tb=short
