@@ -1,0 +1,198 @@
+# Skeleton for .github/dependabot.yml — the structure, not the package names.
+#
+# Pinning dependencies is the right call: a silent major bump landing in a
+# serving image on a rebuild is the worse failure. But pinning only pays if
+# something notices when a successor ships, and without this file nothing does —
+# every version stays frozen until a human edits the line.
+#
+#
+# THIS FILE IS HALF THE COVERAGE
+# ------------------------------
+# It configures *version* updates: the scheduled sweep below, which opens a pull
+# request when a newer release exists, whatever the reason for it.
+#
+# *Security* updates — the immediate pull request triggered by an alert on a
+# published CVE — are a repository setting under Settings -> Code security, not a
+# config file. Nothing here can assert or restore them, which is why
+# `scripts/bootstrap-repo.py` sets both toggles. If they are ever flipped back
+# off, this file silently degrades to "a CVE published on a Tuesday waits for the
+# Monday sweep" rather than failing.
+#
+# Two consequences of that split, both easy to get backwards:
+#
+#   * Security pull requests are exempt from `open-pull-requests-limit`. They
+#     neither count toward it nor are capped by it, so every limit below governs
+#     the scheduled sweep only.
+#
+#   * A `groups:` entry applies to version updates unless it declares
+#     `applies-to: security-updates`. None below does, so an advisory wave
+#     arrives as one ungrouped pull request per package whatever the grouping
+#     says. Leave it that way: grouping advisories means one unmergeable package
+#     holds up every other fix in the batch, and an advisory is the one case
+#     where the smallest diff that merges on its own beats a tidy inbox.
+#
+#
+# BASE IMAGES ARE DELIBERATELY NOT WATCHED
+# ----------------------------------------
+# Add a `docker` ecosystem only if you want the churn. A pinned major in a
+# Dockerfile is usually chosen rather than tracked — matched to a hosting
+# runtime, or to the floor the build tooling declares — so a bot proposing the
+# next major is proposing a migration, not applying a patch. That stays a human
+# decision.
+#
+# If you do skip it, inventory the FROM lines once and write the count down here.
+# Multi-stage builds mean the file count and the image count differ, and an
+# audit that comes up one short is how an unpinned runtime tag goes unnoticed.
+
+version: 2
+
+updates:
+  # ── Application dependencies ───────────────────────────────────────────────
+  # One entry per ecosystem per directory. For pip, a single entry covers every
+  # requirements file in the directory, so a pin shared via `-r requirements.txt`
+  # is updated once, in the file that declares it.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+
+    # Above the default of 5, and read this as a ceiling rather than a budget.
+    # It costs nothing until it binds, and the only thing a lower number buys is
+    # a higher chance of the silent failure: the groups below exist to make
+    # coupled bumps arrive as one reviewable pull request, and that only works
+    # if a slot is free when the sweep runs. A group pull request with no slot
+    # left does not open, and nothing reports that it did not. The real volume
+    # control is the grouping, not this line.
+    #
+    # What crowds the slots is the ungrouped long tail, especially anything
+    # date-versioned that ships several times a month.
+    open-pull-requests-limit: 10
+
+    commit-message:
+      prefix: chore
+      include: scope
+
+    # Order is significant. A dependency joins the FIRST group whose patterns
+    # match, in the order written here, so the catch-all must stay last — a `*`
+    # pattern above a coupling group swallows it and undoes the reason it exists.
+    # Do not restate the coupling groups as `exclude-patterns` on the catch-all:
+    # that is a second list to keep in sync for something ordering already
+    # decides.
+    groups:
+      # Group by what has to LAND TOGETHER to be reviewable, not by vendor.
+      #
+      # The test is whether the pull request can be judged by reading it alone.
+      # A framework that declares an unbounded floor on a library the app also
+      # imports directly is one group: the library bumping alone is not
+      # reviewable without the framework it has to land beside. Anything
+      # wrapping two packages and resolving one of them by string name belongs
+      # with both.
+      #
+      # Majors stay IN a coupling group on purpose. A major on one side with
+      # last major's other side is precisely the mismatch the grouping prevents.
+      web-stack:
+        patterns:
+          - REPLACE-framework
+          - REPLACE-its-unbounded-dependency
+
+      # The long tail, collapsed — minor and patch only, so every major still
+      # arrives alone to be judged on its own. A major is not a
+      # review-by-reading change, and the premise of this whole file is that the
+      # diff is where a bump gets judged.
+      #
+      # Worth adding even when it is a no-op today: it is what stops the *next*
+      # dependency added to this project from arriving ungrouped by default,
+      # which is how a long tail accumulates in the first place.
+      minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
+
+    # Only for a ceiling upstream does not let you clear — not for a major you
+    # would rather defer.
+    #
+    # The case this is for: an integration package caps a dependency below its
+    # newest release, and the capping version is itself the newest published, so
+    # no combination resolves. The pull request is unmergeable the moment it
+    # opens, fails at the dependency-resolve step, and reopens every week
+    # burning a slot.
+    #
+    # Scope it to majors, never a blanket dependency-name ignore, so the package
+    # keeps flowing inside the range the cap allows.
+    #
+    # What this does NOT suppress, because the direction is commonly assumed
+    # wrong: an ignore scoped by `update-types` reaches version updates only —
+    # "update-types only affects security updates" is false, and the value
+    # `version-update:semver-major` is namespaced to say so. The sibling
+    # `versions:` key is the one that reaches security updates. So a CVE fixed
+    # only above the cap still arrives as a security pull request. It just
+    # arrives red, failing the same resolve, because the ceiling is upstream and
+    # an advisory does not move it. Loud and blocked, not silent. Deleting the
+    # entry would not help; only the upstream cap moving does.
+    #
+    # Every entry is a snapshot of an upstream constraint on the day it was
+    # written, and stays in force until edited. Nothing re-checks it. Note the
+    # date and delete it as soon as the ceiling lifts.
+    #
+    # ignore:
+    #   - dependency-name: REPLACE-capped-package
+    #     update-types:
+    #       - version-update:semver-major
+
+  # ── The actions used by ci.yml ─────────────────────────────────────────────
+  # Portable as written. Actions pinned to floating majors (`@v7`) produce a
+  # pull request only on a major release — a handful a year — and they are
+  # reviewed as "does CI still pass", not one at a time. So: one group, no
+  # update-types filter.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    commit-message:
+      prefix: chore
+      include: scope
+    groups:
+      actions:
+        patterns:
+          - "*"
+
+  # ── A frontend, if there is one ────────────────────────────────────────────
+  # Same argument as the pip block. Two groupings earn their keep in almost every
+  # JS project:
+  #
+  #   * A UI framework with its `@types/*` packages, majors included — a major
+  #     against last major's types typechecks against the wrong API, and if the
+  #     build script runs the typechecker that is a red CI job rather than a
+  #     runtime surprise.
+  #
+  #   * Build tooling, minor and patch only — a bundler or compiler major
+  #     changes the build contract and gets its own pull request.
+  #
+  # And one exclusion worth making deliberately: leave a browser-test runner
+  # ungrouped, and exclude it from the catch-all to keep it that way, if CI
+  # caches browser binaries keyed on its exact version. A bump there is also a
+  # cache miss and a full browser reinstall, which is worth seeing on its own.
+  #
+  # - package-ecosystem: npm
+  #   directory: "/frontend"
+  #   schedule:
+  #     interval: weekly
+  #     day: monday
+  #   open-pull-requests-limit: 10
+  #   commit-message:
+  #     prefix: chore
+  #     include: scope
+  #   groups:
+  #     framework:
+  #       patterns: [react, react-dom, "@types/react", "@types/react-dom"]
+  #     tooling:
+  #       patterns: [vite, "@vitejs/*", typescript, postcss, "@types/node"]
+  #       update-types: [minor, patch]
+  #     minor-patch:
+  #       patterns: ["*"]
+  #       exclude-patterns: ["@playwright/test"]
+  #       update-types: [minor, patch]

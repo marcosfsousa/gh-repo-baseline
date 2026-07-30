@@ -1,0 +1,152 @@
+# Skeleton for .github/workflows/ci.yml — the idioms, not the jobs.
+#
+# Copy this in, then replace the placeholder job. What is worth carrying between
+# repos is the frame around the jobs: the trigger, the concurrency policy, the
+# token permissions, and a per-job timeout. Those are the same argument
+# everywhere. The jobs themselves never are.
+#
+#
+# ONE JOB PER SEAM
+# ----------------
+# Split by the layer that can break, not by convenience. A red check should name
+# the layer without anyone opening logs. Backend suite, image build, frontend
+# build, browser tests — four jobs, not one job with four steps, because a
+# failing step in a single job tells you only that "CI" is red.
+#
+#
+# JOB `name:` VALUES ARE A CONTRACT
+# ---------------------------------
+# A job's `name:` is the status-check identifier branch protection matches, and
+# it matches by *string*. GitHub does not verify that a required context
+# corresponds to anything, so renaming a job silently detaches any rule pointing
+# at the old name: the check never reports, and a rule waiting on a check that
+# never arrives is indistinguishable from one that has not run yet. The pull
+# request sits pending rather than failing — which reads as "still working"
+# instead of "misconfigured", at exactly the moment it matters, on the pull
+# request that did the renaming, with a green tick.
+#
+# A job with no `name:` reports its job id instead. Both are contracts.
+#
+# Copy templates/tests/test_required_checks.py in alongside this file. It holds
+# these names and the ruleset's required contexts equal in both directions, so a
+# rename fails the suite instead of quietly unprotecting the branch.
+#
+#
+# NO SECRETS, DELIBERATELY
+# ------------------------
+# Configure none unless a job genuinely cannot run without one. A keyless run is
+# a standing assertion that the suites are offline: a test that starts reaching
+# a live service fails here even when it passes on a developer machine with a
+# populated .env. That assertion is worth more than the convenience of having a
+# key available, and it decays the moment one is added "just for now".
+#
+# It is also the cheapest way to keep a fork's pull request from needing
+# privileged access to be reviewable.
+#
+#
+# THE PLACEHOLDER BELOW IS NOT A GATE
+# -----------------------------------
+# It is green and it asserts nothing. Replace it before adding its context to a
+# ruleset — a required check that always passes is worse than an absent one,
+# because the settings UI, the diff, and the pull request all report protection
+# that is not there.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Supersede a running build when a pull request gets a new commit, so the newest
+# commit is what the checks report. Pushes to the protected branch are never
+# cancelled — every commit on the baseline gets its own verdict, which is what
+# gives a branch a known-good base to be compared against.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Least privilege for GITHUB_TOKEN, set here rather than relied on from the
+# repository default — the default is a repository setting, so a workflow that
+# does not declare this inherits whatever that happens to be. Add the narrowest
+# extra scope to the one job that needs it, never to the file.
+permissions:
+  contents: read
+
+jobs:
+  # ── Replace this whole job. ─────────────────────────────────────────────────
+  placeholder:
+    name: Placeholder (replace me)
+    runs-on: ubuntu-latest
+    # Every job gets one. The budget is normally dominated by dependency
+    # install, so pick a number the job clears comfortably and read anything
+    # past it as stuck rather than slow. Without this, a hung step — a dev
+    # server that starts and never serves is the classic — holds a runner for
+    # the six-hour default.
+    timeout-minutes: 10
+    steps:
+      # Pinned to a floating major, so only a major release produces a
+      # Dependabot pull request. templates/dependabot.yml groups them.
+      - uses: actions/checkout@v7
+
+      - name: Assert nothing
+        run: echo "Replace this job before requiring its context."
+
+  # ── Shapes worth copying, kept as comments so this file stays valid. ───────
+  #
+  # A language runtime, with its version matched to whatever actually runs in
+  # production. Pin the same version in the Dockerfile and here, and move them
+  # together — a split leaves CI testing a runtime the deploy image does not
+  # use, which is a green suite that proves nothing about the artifact.
+  #
+  #   - uses: actions/setup-python@v7
+  #     with:
+  #       python-version: "3.11"
+  #       cache: pip
+  #       cache-dependency-path: requirements.txt
+  #
+  # Install the *deploy* manifest unchanged, then add test-only tools
+  # separately, pinned. Installing a dev superset makes CI faithful to nothing:
+  # a module the app imports but the image does not carry resolves fine here and
+  # fails at container start.
+  #
+  #   - run: |
+  #       python -m pip install --upgrade pip
+  #       pip install -r requirements.txt
+  #       pip install pytest==9.1.1
+  #
+  # Build the image and import the app inside it, if the repo ships one. This is
+  # a different assertion from the suite above and catches what the suite
+  # cannot: a bare runner has the whole checkout on disk, so it never exercises
+  # the image's COPY list. With an enumerated COPY, a new import breaks the
+  # image at import time with nothing in the repo to notice until deploy.
+  #
+  #   - run: docker build -t app:ci .
+  #   - run: docker run --rm app:ci python -c "import app.main"
+  #
+  # Browser binaries cache on the exact resolved test-runner version, since they
+  # are version-locked to it. System libraries live outside the cached path and
+  # must be installed on every run — hence the two mutually exclusive steps.
+  #
+  #   - id: pw-version
+  #     run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+  #   - id: pw-cache
+  #     uses: actions/cache@v6
+  #     with:
+  #       path: ~/.cache/ms-playwright
+  #       key: ${{ runner.os }}-playwright-${{ steps.pw-version.outputs.version }}
+  #   - if: steps.pw-cache.outputs.cache-hit != 'true'
+  #     run: npx playwright install --with-deps chromium
+  #   - if: steps.pw-cache.outputs.cache-hit == 'true'
+  #     run: npx playwright install-deps chromium
+  #
+  # Upload diagnostics on failure only. A report and retained traces are usually
+  # the only way to diagnose a failure that will not reproduce locally.
+  #
+  #   - if: failure()
+  #     uses: actions/upload-artifact@v7
+  #     with:
+  #       name: report
+  #       path: test-results/
+  #       retention-days: 7
