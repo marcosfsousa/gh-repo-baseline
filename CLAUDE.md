@@ -78,24 +78,23 @@ parsing must match — the return types differ deliberately.
 
 ## Remote
 
-`https://github.com/marcosfsousa/gh-repo-baseline`, private, created 2026-07-30.
-Not public: nothing in it is secret, but it encodes how these repos are protected
-and the templates still carry `REPLACE-` placeholders. Going public is a decision
-to ask about, not a default.
+`https://github.com/marcosfsousa/gh-repo-baseline`, created 2026-07-30.
 
-**`main` is NOT protected, and cannot be while the repo is private.** Rulesets are
-gated by plan and visibility together: on a free personal account a private repo
-can have neither a ruleset nor a classic protected branch. `.github/rulesets/main.json`
-is committed and correct — it is the record and the body that would be applied —
-but nothing enforces it.
+**Public, and that is load-bearing rather than a preference.** It was created
+private, and applying the baseline to it failed: rulesets are gated by plan *and*
+visibility, so a private repo on a free personal account can have neither a
+ruleset nor a classic protected branch. Making it public is what bought the
+protection. Do not flip it back to private without understanding that doing so
+silently removes all branch protection — the ruleset stops applying and
+`.github/rulesets/main.json` becomes a record of something that is not enforced.
 
-So `Tests (pytest)` runs on every PR and can go red without blocking a merge. Treat
-the discipline as manual until the repo goes public or the plan changes: read CI
-before merging, because nothing will stop you.
+`main` is protected by ruleset id `20044404`, `enforcement: active`, with
+`Tests (pytest)` as the required check and strict mode on. So work goes through a
+PR, and `tests/test_required_checks.py` guards something real. The root commit was
+pushed directly, since there was no base to open a PR against.
 
-`delete_branch_on_merge` and both Dependabot toggles *were* applied — those are
-not plan-gated. The root commit was pushed directly, since there was no base to
-open a PR against.
+`delete_branch_on_merge` and both Dependabot toggles are applied; those were never
+plan-gated and worked while the repo was still private.
 
 ## Verifying a change to bootstrap-repo.py
 
