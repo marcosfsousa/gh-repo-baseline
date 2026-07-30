@@ -141,13 +141,35 @@ class TestScalarNames:
         workflow.write_text("jobs:\n  build:\n    name: # replaced later\n", encoding="utf-8")
         assert boot._job_contexts(workflow) == ["build"]
 
-    @pytest.mark.parametrize("value", ["|", ">", ">-", "|+", "|2", "> # c"])
+    @pytest.mark.parametrize(
+        "value",
+        ["|", ">", ">-", "|+", "|2", "> # c",
+         # Both indicator orders. `|2-` and `>2-` were derived as literal
+         # contexts by the first version of this: the silent failure, not the
+         # loud one, in the one function written to prevent it.
+         "|2-", ">2-", "|3+", "|-2", ">+1", "|10"],
+    )
     def test_block_scalars_are_refused(self, boot, value):
         # Refused rather than folded: correct folding is chomping and indent
         # indicators and blank-line rules, duplicated across two copies of this
         # parser that no test can prove right — only prove equal.
         with pytest.raises(ValueError, match="block scalar"):
             boot._scalar(value)
+
+    @pytest.mark.parametrize("value", ["~", "null", "Null", "NULL"])
+    def test_yaml_null_tokens_fall_back_to_the_job_id(self, boot, value):
+        # Same resolution as a comment-only name: YAML says null, so GitHub
+        # reports the job id. Deriving the literal `null` would require a check
+        # nothing reports.
+        assert boot._scalar(value) is None
+
+    def test_a_quoted_null_token_is_an_ordinary_string(self, boot):
+        # Quoting is what separates the two, so the null check has to run after
+        # the quoted branch rather than before it.
+        assert boot._scalar("'null'") == "null"
+        assert boot._scalar('"~"') == "~"
+        # And a casing YAML's core schema does not treat as null stays a string.
+        assert boot._scalar("nUll") == "nUll"
 
     def test_a_greater_than_inside_a_name_is_not_a_block_scalar(self, boot):
         # The refusal keys on the indicator shape, not on the character.
@@ -192,6 +214,28 @@ class TestBothParserCopiesAgree:
         # a value containing one is truncated on that pattern and not on every `#`.
         for value in ("A name  # trailing", "Issue #42 in the name", "plain", "a#b", "#lead"):
             assert template_guard._strip_comment(value) == boot._strip_comment(value), value
+
+    @pytest.mark.parametrize("value", [
+        "Backend tests (pytest)", '"Frontend typecheck + build"', "'Build #1'",
+        "'Bob''s job'", "UI tests (Playwright)  # the slow one", "# only a comment",
+        "~", "null", "Null", "NULL", "nUll", "'null'", "Backend > frontend",
+        "|pipe| in a name", "|", ">-", "|2", "|2-", ">2-", "|3+", "'unterminated",
+        '"a \\" escape"', "''", '""',
+    ])
+    def test_same_scalar_reading(self, boot, template_guard, value):
+        # The shapes the two copies previously disagreed on: the tool learned to
+        # read quoted names and refuse block scalars one release before the guard
+        # did, and nothing here could see it — the fixtures above contain none of
+        # these shapes, which is precisely the blind spot that let it happen.
+        #
+        # Compared including *which* inputs raise, not just the values returned.
+        def result(mod):
+            try:
+                return ("ok", mod._scalar(value))
+            except ValueError:
+                return ("refused", None)
+
+        assert result(template_guard) == result(boot), value
 
 
 # ── The ruleset body ──────────────────────────────────────────────────────────
@@ -389,16 +433,34 @@ class TestPlanAndVisibilityGating:
         assert report.changed == 0
 
 
-_OUTPUT_CALLS = {"print", "sys.exit", "parser.error"}
+# `argparse.ArgumentParser(description=..., epilog=...)` and
+# `parser.add_argument(help=...)` all reach the console through `--help`, which
+# is output like any other. The --dry-run help text is several lines long, so
+# this is not a theoretical surface.
+_OUTPUT_CALLS = {
+    "print", "sys.exit", "parser.error",
+    "argparse.ArgumentParser", "parser.add_argument",
+}
+
+# Reporter.ok and Reporter.did print their argument, so a string handed to either
+# reaches the console without ever appearing inside a `print(...)` call. Matched
+# on the method name alone rather than on `report.ok`, so renaming the variable
+# that holds the Reporter cannot silently switch the scanning off.
+_REPORTER_SINKS = {"ok", "did"}
 
 
-def _called_name(func) -> str | None:
-    """``print``, ``sys.exit``, ``parser.error`` — the dotted form, or None."""
+def _is_output_call(func) -> bool:
+    """Does this call put its arguments on a stream?"""
     if isinstance(func, ast.Name):
-        return func.id
-    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-        return f"{func.value.id}.{func.attr}"
-    return None
+        return func.id in _OUTPUT_CALLS
+    if isinstance(func, ast.Attribute):
+        if func.attr in _REPORTER_SINKS:
+            return True
+        return (
+            isinstance(func.value, ast.Name)
+            and f"{func.value.id}.{func.attr}" in _OUTPUT_CALLS
+        )
+    return False
 
 
 def _non_ascii_in_output(source: str) -> set[str]:
@@ -413,13 +475,18 @@ def _non_ascii_in_output(source: str) -> set[str]:
     very print statement whose em dash caused the original bug went unread. A
     guard that does not cover its own regression is not a regression test.
 
+    ``Reporter.ok`` and ``Reporter.did`` count as output calls. They print their
+    argument, so every ``[ok]`` and ``[set]`` line — most of what this tool says —
+    reaches the console without passing through a literal ``print(...)``. Scanning
+    only ``print`` left all of them unchecked.
+
     Docstrings and comments stay exempt for free: a comment is not in the tree at
     all, and a docstring is a bare expression rather than an argument to a call.
     f-strings are covered, which the regex managed only by accident.
     """
     offenders: set[str] = set()
     for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Call) or _called_name(node.func) not in _OUTPUT_CALLS:
+        if not isinstance(node, ast.Call) or not _is_output_call(node.func):
             continue
         for child in ast.walk(node):
             if isinstance(child, ast.Constant) and isinstance(child.value, str):
@@ -474,6 +541,37 @@ class TestOutputIsConsoleSafe:
 
     def test_calls_that_do_not_write_are_ignored(self):
         assert _non_ascii_in_output('log.info("—")') == set()
+
+    def test_the_reporter_sinks_are_scanned(self):
+        # Reporter.ok and Reporter.did print their argument, so scanning only
+        # `print` left every [ok] and [set] line — most of what this tool says —
+        # unchecked.
+        assert _non_ascii_in_output('report.did(f"ruleset {b} — created")') == {"—"}
+        assert _non_ascii_in_output('report.ok("already — true")') == {"—"}
+
+    def test_renaming_the_reporter_variable_does_not_switch_scanning_off(self):
+        # Matched on the method name, not on the receiver, so this cannot be
+        # disabled by a rename that looks entirely innocent in a diff.
+        assert _non_ascii_in_output('r.did("x — y")') == {"—"}
+
+    def test_argparse_help_text_is_scanned(self):
+        # `--help` is output. The long --dry-run help string makes this a real
+        # surface rather than a theoretical one.
+        assert _non_ascii_in_output('parser.add_argument("--x", help="a — b")') == {"—"}
+        assert _non_ascii_in_output('argparse.ArgumentParser(description="a — b")') == {"—"}
+
+    def test_the_script_really_does_route_output_through_those_sinks(self):
+        # A floor under the two tests above: if Reporter.ok/did stopped being
+        # called, they would still pass while asserting nothing about this script.
+        source = (REPO_ROOT / "scripts" / "bootstrap-repo.py").read_text(encoding="utf-8")
+        called = {
+            node.func.attr
+            for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _REPORTER_SINKS
+        }
+        assert called == _REPORTER_SINKS
 
 
 class TestContextsAreDedupedInOrder:

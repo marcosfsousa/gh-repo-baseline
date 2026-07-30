@@ -206,13 +206,23 @@ def _scalar(value: str) -> str | None:
         right -- only prove equal. A job name is a one-line label, so the shape is
         vanishingly rare and stopping costs nothing.
 
+        The two indicators may appear in **either** order -- ``|2-`` and ``|-2``
+        are both valid headers -- so both are matched. Matching only one order
+        left ``|2-`` deriving the literal context ``|2-``, which is the silent
+        failure this function exists to prevent rather than the loud one.
+
+    ``name: null`` / ``~``
+        YAML's null tokens, so the job id stands exactly as it does for a
+        comment-only name. Quoted, they are ordinary strings and keep their
+        value -- which is why this is checked after the quoted branch, not before.
+
     Raised as ``ValueError`` rather than exiting, because the copy of this in the
     guard template is a test and has no process to exit. Each caller says what to
     do about it.
     """
     value = value.strip()
 
-    if re.match(r"[|>][+-]?\d*(?:\s|$)", value):
+    if re.match(r"[|>][-+]?\d*[-+]?(?:\s|$)", value):
         raise ValueError(
             f"`name:` is a block scalar ({value.split()[0]!r}), whose value is on "
             "the lines below it.\nThis parser reads one-line names only. Write "
@@ -240,7 +250,10 @@ def _scalar(value: str) -> str | None:
             )
         return match.group(1) or None
 
-    return _strip_comment(value) or None
+    # Unquoted, so the null tokens resolve to null and the job id stands. `NULL`
+    # and `Null` are null in YAML's core schema; `nUll` is not, and is a string.
+    stripped = _strip_comment(value)
+    return None if stripped in ("", "~", "null", "Null", "NULL") else stripped
 
 
 def _job_contexts(workflow: Path) -> list[str]:
@@ -579,6 +592,10 @@ def main() -> None:
         print("\nNothing to change.")
     elif args.dry_run:
         print(f"\n{report.changed} change(s) pending. Re-run without --dry-run.")
+        # Said in the output rather than only in --help, because this line is
+        # what a person reads before believing the run would succeed. A dry run
+        # performs no writes, so it cannot establish that the writes are allowed.
+        print("Reads only, so this does not prove the writes would be permitted.")
     else:
         print(f"\n{report.changed} change(s) applied.")
         if not unprotected:
