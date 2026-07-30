@@ -6,8 +6,9 @@
 That file is a guard, and a guard that cannot go red is not a guard. Asserting it
 passes on a correct repo proves almost nothing — a file containing no assertions
 at all would do the same. So this suite assembles a throwaway repo out of
-``templates/``, checks the guard passes, and then breaks the repo eight different
-ways and checks the guard fails **on exactly the intended tests and no others**.
+``templates/``, checks the guard passes, and then breaks the repo twelve
+different ways and checks the guard fails **on exactly the intended tests and no
+others**.
 
 The "no others" half matters as much as the rest. A mutation that trips six tests
 instead of the one that describes it means the failure message a person reads
@@ -146,6 +147,13 @@ def _drop_rule(root, rule_type: str) -> None:
     _write_ruleset(root, data)
 
 
+def _set_top_level(root, key: str, value) -> None:
+    data = _read_ruleset(root)
+    assert key in data, f"no {key} to change"
+    data[key] = value
+    _write_ruleset(root, data)
+
+
 def _edit_checks_params(root, key: str, value) -> None:
     data = _read_ruleset(root)
     rule = next(r for r in data["rules"] if r["type"] == "required_status_checks")
@@ -171,10 +179,10 @@ class TestTheGuardPasses:
              "-q", "--no-header", "--collect-only", "-p", "no:cacheprovider"],
             capture_output=True, text=True,
         )
-        assert "15 tests collected" in result.stdout, result.stdout[-600:]
+        assert "20 tests collected" in result.stdout, result.stdout[-600:]
 
 
-# ── The guard on eight broken repos ───────────────────────────────────────────
+# ── The guard on twelve broken repos ──────────────────────────────────────────
 #
 # Each entry is (label, mutation, the exact set of tests that must fail).
 
@@ -238,6 +246,35 @@ MUTATIONS = [
         }),
         {"test_it_targets_the_protected_branch"},
         id="the-ruleset-is-retargeted",
+    ),
+    pytest.param(
+        lambda root: _drop_rule(root, "pull_request"),
+        {"test_a_pull_request_is_required"},
+        id="a-direct-push-becomes-possible",
+        # The last repo-level assertion that had never been proven able to go
+        # red. Without the rule a push straight to the protected branch is
+        # accepted, and every other test here stays green.
+    ),
+    pytest.param(
+        lambda root: _set_top_level(root, "enforcement", "disabled"),
+        {"test_it_is_actively_enforced"},
+        id="enforcement-is-switched-off",
+    ),
+    pytest.param(
+        lambda root: _set_top_level(root, "enforcement", "evaluate"),
+        {"test_it_is_actively_enforced"},
+        id="enforcement-is-set-to-dry-run",
+        # The sneakier of the two: `evaluate` reports what it would have blocked
+        # and blocks nothing, so the settings UI shows a live ruleset with every
+        # rule intact. Asserted separately from `disabled` because it is the one
+        # someone reaches for while testing and then forgets to put back.
+    ),
+    pytest.param(
+        lambda root: _set_top_level(root, "target", "tag"),
+        {"test_it_targets_branches"},
+        id="the-ruleset-is-retargeted-to-tags",
+        # Name, rules and ref_name condition all survive; `refs/heads/main`
+        # simply matches no tag, so the whole thing enforces against nothing.
     ),
 ]
 

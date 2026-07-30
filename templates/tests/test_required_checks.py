@@ -75,6 +75,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 
 # ── Per-repo constants. Check these three after copying. ──────────────────────
 
@@ -95,6 +97,84 @@ _RULESET = _REPO_ROOT / ".github" / "rulesets" / "main.json"
 def _strip_comment(value: str) -> str:
     """YAML comment rule: `#` opens a comment at line start or after whitespace."""
     return re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip()
+
+
+def _scalar(value: str) -> str | None:
+    """
+    What a job's ``name:`` denotes, or ``None`` when it denotes nothing and the
+    job id stands as the context.
+
+    Stripping comments unconditionally is wrong for four shapes, and wrong here
+    is silent: a context that does not match what the job reports never arrives,
+    and a rule waiting on a check that never arrives leaves the pull request
+    pending rather than red.
+
+    ``name: 'Build #1'``
+        A quoted scalar. ``#`` opens a comment only outside quotes, so the value
+        is read to its closing quote instead of truncated at the hash — which
+        would derive ``Build`` and require a check nothing reports.
+
+    ``name:`` followed only by a comment
+        Denotes null, and GitHub falls back to the job id. ``None`` says so, and
+        leaves the id the caller already recorded in place. A bare ``name:`` with
+        nothing after it already behaved this way; this makes the two agree
+        rather than deriving an empty context from one of them.
+
+    ``name: >`` / ``name: |``
+        A block scalar, whose value is on the lines below. Refused rather than
+        folded: correct folding means chomping indicators, indent indicators and
+        blank-line rules, in two copies of this parser that no test can prove
+        right — only prove equal. A job name is a one-line label, so the shape is
+        vanishingly rare and stopping costs nothing.
+
+        The two indicators may appear in **either** order — ``|2-`` and ``|-2``
+        are both valid headers — so both are matched. Matching only one order
+        left ``|2-`` deriving the literal context ``|2-``, which is the silent
+        failure this function exists to prevent rather than the loud one.
+
+    ``name: null`` / ``~``
+        YAML's null tokens, so the job id stands exactly as it does for a
+        comment-only name. Quoted, they are ordinary strings and keep their
+        value — which is why this is checked after the quoted branch, not before.
+
+    Raised as ``ValueError`` rather than exiting, because this copy is a test and
+    has no process to exit. The copy in the baseline's ``bootstrap-repo.py``
+    catches it and exits; here it fails the suite, which is the same refusal.
+    """
+    value = value.strip()
+
+    if re.match(r"[|>][-+]?\d*[-+]?(?:\s|$)", value):
+        raise ValueError(
+            f"`name:` is a block scalar ({value.split()[0]!r}), whose value is on "
+            "the lines below it.\nThis parser reads one-line names only. Write "
+            "the name inline."
+        )
+
+    if value.startswith("'"):
+        # `''` is how YAML escapes a quote inside a single-quoted scalar, so the
+        # closing quote is the first one that is not doubled.
+        match = re.match(r"'((?:[^']|'')*)'", value)
+        if not match:
+            raise ValueError(
+                f"`name:` opens with a quote it never closes: {value!r}.\n"
+                "There is no value to read."
+            )
+        return match.group(1).replace("''", "'") or None
+
+    if value.startswith('"'):
+        match = re.match(r'"([^"\\]*)"', value)
+        if not match:
+            raise ValueError(
+                f"`name:` is a double-quoted scalar this parser cannot read: "
+                f"{value!r}.\nBackslash escapes and unterminated quotes are "
+                "refused rather than guessed at."
+            )
+        return match.group(1) or None
+
+    # Unquoted, so the null tokens resolve to null and the job id stands. `NULL`
+    # and `Null` are null in YAML's core schema; `nUll` is not, and is a string.
+    stripped = _strip_comment(value)
+    return None if stripped in ("", "~", "null", "Null", "NULL") else stripped
 
 
 def _job_contexts(workflow: Path) -> dict[str, str]:
@@ -130,7 +210,17 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
             continue
         name = re.match(r"^    name:\s*(.+)$", line)
         if name and current:
-            contexts[current] = _strip_comment(name.group(1)).strip("'\"")
+            # A refusal propagates and fails the suite, naming the job. That is
+            # the right outcome: a `name:` this cannot read is a context it
+            # cannot check, and passing would mean checking nothing.
+            try:
+                scalar = _scalar(name.group(1))
+            except ValueError as exc:
+                raise ValueError(f"{workflow}, job {current!r}: {exc}") from None
+            # None means the name denotes nothing, so the job id already recorded
+            # above stands — which is what GitHub reports for such a job.
+            if scalar is not None:
+                contexts[current] = scalar
     return contexts
 
 
@@ -277,6 +367,31 @@ class TestRulesetKeepsItsBaseline:
     baseline repo for the argument behind each.
     """
 
+    def test_it_is_actively_enforced(self):
+        # `evaluate` is GitHub's dry-run mode and `disabled` is off. Both leave
+        # every rule below intact in the file and in the settings UI, and neither
+        # blocks anything — so without this, flipping one word unprotects the
+        # branch while the whole of this suite stays green.
+        enforcement = _load_ruleset().get("enforcement")
+        assert enforcement == "active", (
+            f"The ruleset's enforcement is {enforcement!r}, not 'active'.\n"
+            "`evaluate` reports what it would have done and blocks nothing; "
+            "`disabled` does not even do that. The rules below are all still "
+            "present in either case, which is what makes this worth asserting "
+            "separately."
+        )
+
+    def test_it_targets_branches(self):
+        # A ruleset retargeted to `tag` keeps its name, its rules, and its
+        # ref_name condition — `refs/heads/main` simply matches no tag, so it
+        # applies to nothing while reading as fully configured.
+        target = _load_ruleset().get("target")
+        assert target == "branch", (
+            f"The ruleset's target is {target!r}, not 'branch'.\n"
+            "Its conditions still name a branch, so it now matches nothing at "
+            "all — the rules are intact and enforce against an empty set."
+        )
+
     def test_it_targets_the_protected_branch(self):
         include = _load_ruleset().get("conditions", {}).get("ref_name", {}).get("include", [])
         expected = [f"refs/heads/{_PROTECTED_BRANCH}"]
@@ -398,6 +513,32 @@ class TestGuardIsNotVacuous:
             # No `name:`, so GitHub reports the job id — and so does this.
             "unnamed": "unnamed",
         }
+
+    def test_a_hash_inside_quotes_is_not_a_comment(self):
+        # `#` opens a comment only outside quotes. Truncating here would derive
+        # `Build` for a job reporting `Build #1`, and a required check nothing
+        # reports leaves the pull request pending rather than red.
+        assert _scalar("'Build #1'") == "Build #1"
+        assert _scalar('"Build #1"') == "Build #1"
+        assert _scalar("'Bob''s job'") == "Bob's job"
+
+    def test_a_name_denoting_nothing_falls_back_to_the_job_id(self):
+        # `name:` followed only by a comment, and YAML's null tokens, all resolve
+        # to null — GitHub reports the job id, so None leaves it standing.
+        for value in ("# just a comment", "~", "null", "Null", "NULL"):
+            assert _scalar(value) is None, value
+        # Quoted, they are ordinary strings.
+        assert _scalar("'null'") == "null"
+
+    def test_shapes_this_parser_will_not_guess_at_are_refused(self):
+        # Loud beats silently wrong: a `name:` this cannot read is a context it
+        # cannot check. Both indicator orders count — `|2-` derived the literal
+        # context `|2-` before it did.
+        for value in ("|", ">-", "|2", "|2-", ">2-", "|3+", "'unterminated"):
+            with pytest.raises(ValueError):
+                _scalar(value)
+        # And the refusal keys on the header shape, not on the character.
+        assert _scalar("Backend > frontend") == "Backend > frontend"
 
     def test_trigger_branches_are_collected(self, tmp_path):
         assert _trigger_branches(_WORKFLOW).get("pull_request") == [_PROTECTED_BRANCH]

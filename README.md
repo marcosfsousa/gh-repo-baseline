@@ -86,22 +86,25 @@ unprotecting itself.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                                    # 48 tests
+pytest
 ```
 
 What the suite actually asserts, since "the guard passes" is nearly worthless on
 its own:
 
-- **`tests/test_bootstrap.py`** — the parser across every shape YAML allows, the
+- **`tests/test_bootstrap.py`** — the parser across every shape YAML allows
+  (including the quoted, null and block-scalar names it refuses to guess at), the
   ruleset body (retargeting, strict mode, omit-vs-empty), and that comparison is
   order-insensitive. That last one is a regression test: the API returns required
   checks in workflow-declaration order, so comparing raw made the tool report a
   phantom change and rewrite the ruleset on every run.
 - **`tests/test_guard.py`** — assembles a throwaway repo out of `templates/`,
-  confirms the guard passes, then breaks it **eight ways** and confirms the guard
-  fails on *exactly* the intended tests and no others: job renamed, seam added
-  but not required, rule dropped, rule emptied, strict mode off, CI trigger moved
-  off the protected branch, force-push unblocked, ruleset retargeted.
+  confirms the guard passes, then breaks it **twelve ways** and confirms the
+  guard fails on *exactly* the intended tests and no others: job renamed, seam
+  added but not required, rule dropped, rule emptied, strict mode off, CI trigger
+  moved off the protected branch, force-push unblocked, pull request no longer
+  required, ruleset retargeted to another branch and to tags, enforcement
+  disabled and set to `evaluate`.
 
   "And no others" matters as much as the rest — a mutation that trips six tests
   means the message someone reads won't name what broke.
