@@ -225,15 +225,31 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
     return contexts
 
 
-def _trigger_branches(workflow: Path) -> dict[str, list[str]]:
+def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     """
-    ``{event: [branch, ...]}`` from the workflow's ``on:`` block.
+    ``{event: branch filter}`` from the workflow's ``on:`` block, where ``None``
+    means the event declares no ``branches:`` filter and therefore fires on every
+    branch.
 
-    Only the inline form (``branches: [main]``) is read. A block list parses as
-    no branches at all, which fails the assertion rather than passing it — the
-    wrong direction to be lenient in, given what the check is for.
+    **``None`` and ``[]`` are different answers**, and collapsing them was a bug.
+    An event with no filter covers the protected branch by covering everything;
+    an event whose filter this cannot read covers nothing it can *prove*. Both
+    used to parse as ``[]``, so a workflow running on every pull request — the
+    shape a repo reaches for when its work targets more than one base branch —
+    read here as one running on none, and the assertion below failed on a
+    correctly configured repo. That direction is not the safe one it looks like:
+    a guard that cries wolf on a good config is a guard someone deletes.
+
+    Only the inline form (``branches: [main]``) is read. A block list still
+    parses as ``[]`` and fails the assertion rather than passing it — the wrong
+    direction to be lenient in, given what the check is for.
+
+    ``branches-ignore`` is recorded as ``[]`` for that same reason. It is a
+    filter this does not evaluate, so it cannot show the protected branch
+    survives it, and it must not reach the unfiltered pass above by being
+    mistaken for "no filter at all".
     """
-    branches: dict[str, list[str]] = {}
+    branches: dict[str, list[str] | None] = {}
     lines = workflow.read_text(encoding="utf-8").splitlines()
 
     try:
@@ -250,15 +266,23 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str]]:
         event = re.match(r"^  ([A-Za-z_]+):\s*$", line)
         if event:
             current = event.group(1)
-            branches.setdefault(current, [])
+            branches.setdefault(current, None)  # no filter seen yet
+            continue
+        if not current:
             continue
         listed = re.match(r"^    branches:\s*\[(.*)\]\s*$", line)
-        if listed and current:
+        if listed:
             branches[current] = [
                 item.strip().strip("'\"")
                 for item in listed.group(1).split(",")
                 if item.strip()
             ]
+            continue
+        # A `branches:` this cannot read, or a `branches-ignore:` it will not
+        # evaluate. Either way a filter is present and unproven, which is not the
+        # same as absent — so it must not stay `None`.
+        if re.match(r"^    branches(?:-ignore)?:", line):
+            branches[current] = []
     return branches
 
 
@@ -349,14 +373,30 @@ class TestChecksCanActuallyReport:
     def test_ci_runs_on_the_protected_branch(self):
         triggers = _trigger_branches(_WORKFLOW)
         for event in ("pull_request", "push"):
-            assert _PROTECTED_BRANCH in triggers.get(event, []), (
-                f"The workflow's `on.{event}.branches` is {triggers.get(event)!r} "
-                f"and does not include {_PROTECTED_BRANCH!r}.\n"
+            # Membership first, and separately. `None` means "declared, with no
+            # branch filter" — every branch, which covers the protected one. A
+            # missing event is the opposite and would read as exactly the same
+            # `None` out of `.get`, passing the assertion that follows.
+            assert event in triggers, (
+                f"The workflow declares no `on.{event}` trigger at all.\n"
+                f"Nothing would report on {event} to {_PROTECTED_BRANCH!r}, so a "
+                "required check waiting on it never arrives — and a pull request "
+                "waiting on a check that never arrives sits pending rather than "
+                "red."
+            )
+            covered = triggers[event]
+            assert covered is None or _PROTECTED_BRANCH in covered, (
+                f"The workflow's `on.{event}.branches` is {covered!r} and does "
+                f"not include {_PROTECTED_BRANCH!r}.\n"
                 "The required checks would stop reporting on pull requests to "
                 f"{_PROTECTED_BRANCH}, and a required check that never arrives "
                 "leaves the pull request pending rather than red — "
                 "indistinguishable from one still running. Either restore the "
-                "branch here or narrow the ruleset to a branch CI covers."
+                "branch here or narrow the ruleset to a branch CI covers.\n\n"
+                "An empty list also means this parser could not read the filter "
+                "— a block list or a `branches-ignore`. If that is the shape "
+                "here, the filter is unproven rather than wrong; write it inline "
+                "or assert the coverage some other way."
             )
 
 
@@ -563,20 +603,52 @@ class TestGuardIsNotVacuous:
         # And the refusal keys on the header shape, not on the character.
         assert _scalar("Backend > frontend") == "Backend > frontend"
 
-    def test_trigger_branches_are_collected(self, tmp_path):
-        assert _trigger_branches(_WORKFLOW).get("pull_request") == [_PROTECTED_BRANCH]
-        # A block list is not read, and must therefore fail closed rather than
-        # reporting an empty filter as "no restriction".
+    def test_trigger_events_are_collected(self):
+        # Every assertion about the filters passes vacuously if the parser never
+        # finds the `on:` block, so pin that it finds both events here. The
+        # filter *values* are asserted by test_ci_runs_on_the_protected_branch —
+        # deliberately not pinned to a shape, because both shapes are correct and
+        # which one a repo uses is not this file's business.
+        assert {"pull_request", "push"} <= set(_trigger_branches(_WORKFLOW))
+
+    def test_an_absent_filter_is_not_an_empty_one(self, tmp_path):
+        # The distinction the assertion above rests on. `pull_request:` with no
+        # `branches:` runs on every branch, which covers the protected one; that
+        # is the shape used by a repo whose pull requests target more than one
+        # base. Reporting it as `[]` failed the guard on a correct config.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request:\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "  workflow_dispatch:\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {
+            "pull_request": None,  # no filter at all: every branch
+            "push": ["main"],
+            "workflow_dispatch": None,
+        }
+
+    def test_filters_this_parser_cannot_read_fail_closed(self, tmp_path):
+        # The other half, and the reason the case above is not simply lenient. A
+        # block list and a `branches-ignore` both leave the protected branch
+        # unproven, so they must read as `[]` and fail — never as `None`, which
+        # now passes.
         workflow = tmp_path / "w.yml"
         workflow.write_text(
             "on:\n"
             "  pull_request:\n"
             "    branches:\n"
             "      - main\n"
+            "  push:\n"
+            "    branches-ignore: [main]\n"
             "jobs:\n",
             encoding="utf-8",
         )
-        assert _trigger_branches(workflow) == {"pull_request": []}
+        assert _trigger_branches(workflow) == {"pull_request": [], "push": []}
 
     def test_keys_after_the_jobs_block_are_not_jobs(self, tmp_path):
         # Asserted separately because a parser that walked to EOF would still
