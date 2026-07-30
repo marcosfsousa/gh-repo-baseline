@@ -228,11 +228,19 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
     return contexts
 
 
+# The event-level keys that decide whether a workflow reports on a given push or
+# pull request. Longest-first, because the alternation below is first-match-wins
+# and a leading `branches` would otherwise swallow `branches-ignore`.
+#
+# `tags`/`tags-ignore` are absent deliberately: a tag filter does not change
+# whether a *branch* is covered, which is the only question here.
+_FILTER_KEYS = ("branches-ignore", "branches", "paths-ignore", "paths")
+
+
 def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     """
     ``{event: branch filter}`` from the workflow's ``on:`` block, where ``None``
-    means the event declares no ``branches:`` filter and therefore fires on every
-    branch.
+    means the event declares no filter at all and therefore always reports.
 
     **``None`` and ``[]`` are different answers**, and collapsing them was a bug.
     An event with no filter covers the protected branch by covering everything;
@@ -243,22 +251,41 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     correctly configured repo. That direction is not the safe one it looks like:
     a guard that cries wolf on a good config is a guard someone deletes.
 
-    Only the inline form (``branches: [main]``) is read. A block list still
-    parses as ``[]`` and fails the assertion rather than passing it — the wrong
-    direction to be lenient in, given what the check is for.
+    Only the inline form (``branches: [main]``) is read. A block list parses as
+    ``[]`` and fails the assertion rather than passing it — the wrong direction
+    to be lenient in, given what the check is for. So does ``branches-ignore``,
+    and so does any ``paths``/``paths-ignore``: a path-filtered workflow does not
+    run on a pull request that touches nothing it lists, so its checks never
+    report, which is the same pending-forever failure reached from one key over.
 
-    ``branches-ignore`` is recorded as ``[]`` for that same reason. It is a
-    filter this does not evaluate, so it cannot show the protected branch
-    survives it, and it must not reach the unfiltered pass above by being
-    mistaken for "no filter at all".
+    **The recogniser below is the safety-critical part**, and deliberately
+    tolerant about where the key sits and how it is written. It is what decides
+    between "no filter" and "a filter I cannot read" — so a filter it fails to
+    *see* reads as absent, and absent passes. Matching one exact indent was not
+    enough: ``branches: [develop]`` at three or six spaces, under a quoted key,
+    or with a space before the colon, all parsed as unfiltered and passed this
+    assertion on a workflow that never reports on the protected branch at all.
+    Those shapes are ordinary YAML, and before ``None`` existed they all failed
+    closed, so narrow recognition turned five safe cases into silent ones.
+
+    The residual risk is stated rather than papered over: a filter written in a
+    shape this still cannot see — YAML's explicit-key form, say — reads as
+    absent and passes. That is the cost of ``None`` existing at all. It is
+    bounded by the filter names being a closed, stable set, and it is why they
+    are matched by *name* at any indent rather than by position.
     """
-    branches: dict[str, list[str] | None] = {}
+    filters: dict[str, list[str] | None] = {}
+    unproven: set[str] = set()
     lines = workflow.read_text(encoding="utf-8").splitlines()
 
     try:
         start = next(i for i, line in enumerate(lines) if line.rstrip() == "on:")
     except StopIteration:  # pragma: no cover - asserted directly below
-        return branches
+        return filters
+
+    key_pattern = re.compile(
+        r"^\s{3,}[\"']?(" + "|".join(_FILTER_KEYS) + r")[\"']?\s*:\s*(.*)$"
+    )
 
     current: str | None = None
     for line in lines[start + 1:]:
@@ -269,24 +296,31 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
         event = re.match(r"^  ([A-Za-z_]+):\s*$", line)
         if event:
             current = event.group(1)
-            branches.setdefault(current, None)  # no filter seen yet
+            filters.setdefault(current, None)  # no filter seen yet
             continue
-        if not current:
+        if current is None:
             continue
-        listed = re.match(r"^    branches:\s*\[(.*)\]\s*$", line)
-        if listed:
-            branches[current] = [
+        key = key_pattern.match(line)
+        if not key:
+            continue
+        name, value = key.group(1), _strip_comment(key.group(2))
+        inline = re.fullmatch(r"\[(.*)\]", value)
+        if name == "branches" and inline:
+            filters[current] = [
                 item.strip().strip("'\"")
-                for item in listed.group(1).split(",")
+                for item in inline.group(1).split(",")
                 if item.strip()
             ]
             continue
-        # A `branches:` this cannot read, or a `branches-ignore:` it will not
-        # evaluate. Either way a filter is present and unproven, which is not the
-        # same as absent — so it must not stay `None`.
-        if re.match(r"^    branches(?:-ignore)?:", line):
-            branches[current] = []
-    return branches
+        # `branches-ignore`, a path filter, or a `branches:` whose value is on
+        # the lines below. None of them can be shown to leave the protected
+        # branch covered, so the event is unproven rather than unfiltered.
+        unproven.add(current)
+
+    # `[]` wins over any list read for the same event, whatever the line order.
+    # An event carrying both `branches: [main]` and `paths-ignore:` is filtered
+    # by both, and the half this can read must not vouch for the half it cannot.
+    return {event: ([] if event in unproven else v) for event, v in filters.items()}
 
 
 # ── Reading the ruleset ───────────────────────────────────────────────────────
@@ -637,9 +671,11 @@ class TestGuardIsNotVacuous:
 
     def test_filters_this_parser_cannot_read_fail_closed(self, tmp_path):
         # The other half, and the reason the case above is not simply lenient. A
-        # block list and a `branches-ignore` both leave the protected branch
-        # unproven, so they must read as `[]` and fail — never as `None`, which
-        # now passes.
+        # block list, a `branches-ignore` and a path filter all leave the
+        # protected branch unproven, so they must read as `[]` and fail — never
+        # as `None`, which now passes. The path filter belongs here because a
+        # workflow that skips a pull request reports no check on it, and a
+        # required check that never reports is the failure this file is for.
         workflow = tmp_path / "w.yml"
         workflow.write_text(
             "on:\n"
@@ -648,10 +684,49 @@ class TestGuardIsNotVacuous:
             "      - main\n"
             "  push:\n"
             "    branches-ignore: [main]\n"
+            "  workflow_run:\n"
+            "    paths-ignore: ['**/*.md']\n"
             "jobs:\n",
             encoding="utf-8",
         )
-        assert _trigger_branches(workflow) == {"pull_request": [], "push": []}
+        assert _trigger_branches(workflow) == {
+            "pull_request": [], "push": [], "workflow_run": [],
+        }
+
+    def test_a_filter_written_oddly_is_still_seen(self, tmp_path):
+        # Regression test, and the reason the recogniser matches by name at any
+        # indent. Every shape here is ordinary YAML naming `develop`, and every
+        # one of them parsed as `None` — unfiltered, therefore covered — when the
+        # key was matched at one exact indent. The guard passed while CI never
+        # reported on the protected branch, which is precisely the silent failure
+        # it exists to prevent, introduced by the fix for the noisy one.
+        shapes = {
+            "six spaces":      "      branches: [develop]",
+            "three spaces":    "   branches: [develop]",
+            "quoted key":      '    "branches": [develop]',
+            "space before :":  "    branches : [develop]",
+            "trailing comment": "    branches: [develop]  # only the pivot",
+        }
+        for label, filter_line in shapes.items():
+            workflow = tmp_path / f"{label.replace(' ', '-')}.yml"
+            workflow.write_text(
+                f"on:\n  pull_request:\n{filter_line}\njobs:\n", encoding="utf-8"
+            )
+            assert _trigger_branches(workflow) == {"pull_request": ["develop"]}, label
+
+    def test_an_unreadable_filter_beats_a_readable_one_on_the_same_event(self, tmp_path):
+        # Order-independence, asserted in both directions. An event filtered by
+        # branch *and* by path is gated by both, so the half this can read must
+        # not vouch for the half it cannot — whichever line comes first.
+        for first, second in (
+            ("    branches: [main]", "    paths-ignore: ['docs/**']"),
+            ("    paths-ignore: ['docs/**']", "    branches: [main]"),
+        ):
+            workflow = tmp_path / "w.yml"
+            workflow.write_text(
+                f"on:\n  pull_request:\n{first}\n{second}\njobs:\n", encoding="utf-8"
+            )
+            assert _trigger_branches(workflow) == {"pull_request": []}, first
 
     def test_keys_after_the_jobs_block_are_not_jobs(self, tmp_path):
         # Asserted separately because a parser that walked to EOF would still
