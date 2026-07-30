@@ -43,6 +43,28 @@ Every step is idempotent and reports `[ok]` or `[set]`, so re-running is how you
 correct drift rather than something to avoid. There is no bootstrap window this
 has to land inside.
 
+### Rulesets need a public repo or a paid plan
+
+The hard constraint, found the first time this was pointed at a private repo:
+**on a free personal account, a private repository can have no branch protection
+at all** — not a ruleset, not a classic protected branch. Both are gated by plan
+*and* visibility. The API answers:
+
+```
+403  Upgrade to GitHub Pro or make this repository public to enable this feature.
+```
+
+This is not a token or scope problem, and adding scopes will not fix it. Three
+ways forward: make the repo public, upgrade the plan, or pass `--no-ruleset` to
+say out loud that the branch is unprotected.
+
+The tool relays this as a `[skip]` with the explanation, applies everything else,
+and **exits 2** — a bootstrap tool that exits 0 on an unprotected branch is how a
+repo ends up looking configured while anyone can push to its default branch.
+
+Worth knowing before you plan a rollout: this splits your repos into two classes,
+and it is visibility, not importance, that decides which.
+
 ### What it sets
 
 - `delete_branch_on_merge`
@@ -54,6 +76,44 @@ has to land inside.
 Not per-repo secrets, variables, or the Actions policy. Those are project
 decisions, not baseline.
 
+## It is applied to itself
+
+This repo runs the baseline on its own `main`: `.github/rulesets/main.json` is the
+committed record, `Tests (pytest)` is the required check, and
+`tests/test_required_checks.py` — the live copy of the guard template — holds the
+two together. Rename the CI job and the suite fails instead of the branch quietly
+unprotecting itself.
+
+```bash
+pip install -r requirements-dev.txt
+pytest                                    # 48 tests
+```
+
+What the suite actually asserts, since "the guard passes" is nearly worthless on
+its own:
+
+- **`tests/test_bootstrap.py`** — the parser across every shape YAML allows, the
+  ruleset body (retargeting, strict mode, omit-vs-empty), and that comparison is
+  order-insensitive. That last one is a regression test: the API returns required
+  checks in workflow-declaration order, so comparing raw made the tool report a
+  phantom change and rewrite the ruleset on every run.
+- **`tests/test_guard.py`** — assembles a throwaway repo out of `templates/`,
+  confirms the guard passes, then breaks it **eight ways** and confirms the guard
+  fails on *exactly* the intended tests and no others: job renamed, seam added
+  but not required, rule dropped, rule emptied, strict mode off, CI trigger moved
+  off the protected branch, force-push unblocked, ruleset retargeted.
+
+  "And no others" matters as much as the rest — a mutation that trips six tests
+  means the message someone reads won't name what broke.
+- **Both duplications held honest** — the two copies of the guard, and the two
+  copies of the workflow parser.
+
+Offline by construction: nothing touches the network, so no secrets are
+configured. The tradeoff is explicit — a green run proves the script would send
+the right body, not that it can authenticate. `--dry-run` against a real repo is
+the other half, and stays manual because it needs admin credentials CI should not
+have.
+
 ## Copying the templates
 
 ```
@@ -62,6 +122,11 @@ templates/dependabot.yml                -> .github/dependabot.yml
 templates/tests/test_required_checks.py -> tests/test_required_checks.py
 rulesets/main.json                      -> .github/rulesets/main.json
 ```
+
+Always copy the **template**, never `tests/test_required_checks.py`. That one is
+this repo's live copy and differs only in its header; the two are held identical
+below it by a test, so editing the live one and not the template ships the bug
+outward while keeping this repo green.
 
 All four need editing after the copy; none is drop-in. `ci.yml` ships one
 placeholder job that asserts nothing, `dependabot.yml` has `REPLACE-` package

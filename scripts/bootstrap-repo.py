@@ -31,6 +31,13 @@ account there is no equivalent, and this script is the substitute.
 What this cannot do
 -------------------
 
+**Protect a private repository on a free personal account.** Rulesets are gated by
+plan *and* visibility, and classic protected branches are gated the same way, so
+on that combination there is no branch protection available at all -- the API
+answers 403 with "Upgrade to GitHub Pro or make this repository public". Make the
+repo public, upgrade the plan, or accept an unprotected branch; see
+``RulesetsUnavailable``. Every other step still applies.
+
 Per-repo secrets and variables, and the Actions policy for the repository, are
 deliberately out of scope -- they are not baseline, they are per-project, and a
 tool that set them would need to be told what to set.
@@ -92,9 +99,29 @@ def _gh(args: list[str], body: str | None = None) -> tuple[int, str, str]:
     return result.returncode, result.stdout, result.stderr
 
 
+class RulesetsUnavailable(Exception):
+    """
+    The rulesets API is gated by plan **and** visibility, not just by permission.
+
+    On a free personal account a *private* repository cannot have rulesets, and
+    cannot have classic protected branches either: both are paid features there.
+    The API answers 403 with "Upgrade to GitHub Pro or make this repository
+    public", which is a statement about the plan rather than about the token — so
+    re-authenticating, adding scopes, or checking admin rights will not fix it,
+    and this is raised to say so instead of letting a raw error suggest otherwise.
+
+    It is not fatal to the whole run. The repository settings and the Dependabot
+    toggles are unaffected and still apply, so those steps stand and only this one
+    is skipped — loudly, and with a non-zero exit, because a repo that silently
+    ends up unprotected is the failure this tool exists to prevent.
+    """
+
+
 def _gh_json(path: str) -> object:
     code, out, err = _gh([path])
     if code != 0:
+        if "rulesets" in path and "Upgrade to GitHub Pro" in err:
+            raise RulesetsUnavailable(err.strip())
         sys.exit(f"gh api {path} failed:\n{err.strip()}")
     return json.loads(out)
 
@@ -406,21 +433,54 @@ def main() -> None:
     step_repo_settings(args.repo, report)
     print("code security")
     step_dependabot_alerts(args.repo, report)
+
+    unprotected = False
     if not args.no_ruleset:
         print(f"ruleset on {args.branch}")
-        step_ruleset(args.repo, args.branch, contexts, report)
+        try:
+            step_ruleset(args.repo, args.branch, contexts, report)
+        except RulesetsUnavailable:
+            unprotected = True
+            print(
+                "  [skip]    rulesets are unavailable on this repository.\n"
+                "\n"
+                "            GitHub gates them by plan AND visibility: a private "
+                "repo on a free\n"
+                "            personal account can have neither a ruleset nor a "
+                "classic protected\n"
+                "            branch. This is not a token problem: more scopes "
+                "will not fix it.\n"
+                "\n"
+                "            Three ways forward:\n"
+                "              * make the repository public  "
+                "(gh repo edit --visibility public)\n"
+                "              * upgrade the account to GitHub Pro\n"
+                "              * accept an unprotected branch and pass "
+                "--no-ruleset to say so\n"
+                "\n"
+                "            Everything above this line was applied and is "
+                "unaffected."
+            )
 
-    if report.changed == 0:
+    if report.changed == 0 and not unprotected:
         print("\nNothing to change.")
     elif args.dry_run:
         print(f"\n{report.changed} change(s) pending. Re-run without --dry-run.")
     else:
         print(f"\n{report.changed} change(s) applied.")
-        print(
-            "Copy templates/tests/test_required_checks.py into the target repo "
-            "and commit the\nruleset alongside it, or nothing there will notice "
-            "when these strings drift."
-        )
+        if not unprotected:
+            print(
+                "Copy templates/tests/test_required_checks.py into the target "
+                "repo and commit the\nruleset alongside it, or nothing there will "
+                "notice when these strings drift."
+            )
+
+    if unprotected:
+        # Non-zero even though most of the run succeeded: the branch is not
+        # protected, and a bootstrap tool that exits 0 on that is how a repo ends
+        # up looking configured while anyone can push to its default branch.
+        print(f"\n{args.branch} is NOT protected.")
+        sys.exit(2)
 
 
 if __name__ == "__main__":
