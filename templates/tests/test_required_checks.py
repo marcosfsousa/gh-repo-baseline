@@ -336,9 +336,18 @@ _ON_KEY = re.compile(r"^[\"']?on[\"']?\s*:\s*(.*)$")
 # so is the difference between "unreadable" and "absent".
 _EVENT_KEY = re.compile(r"^  [\"']?([A-Za-z_]+)[\"']?\s*:\s*(.*)$")
 
-# A commented-out event key: at the event indent, and a bare key with nothing
-# after the colon. Deliberately not every comment — see `_trigger_branches`.
-_COMMENTED_EVENT = re.compile(r"^  #+\s*[\"']?[A-Za-z_]+[\"']?\s*:\s*$")
+# A commented-out event key: at the event indent, and shaped like a key. What
+# follows the colon is not constrained, because a disabled event is commonly
+# disabled with a note saying why — `# workflow_run:  # off for now`. Requiring
+# nothing after the colon missed exactly that shape, and a missed one hands its
+# orphaned keys to the live event above as if they were its filter.
+#
+# Over-matching is the safe direction here and under-matching is not, which is
+# why this is loose. A comment this wrongly reads as an event key can only
+# orphan the keys below it, and `_trigger_branches` refuses rather than guesses
+# when an orphan is ambiguous. Still deliberately not every comment: a note with
+# no colon leaves the event alone, and so does anything below the event indent.
+_COMMENTED_EVENT = re.compile(r"^  #+\s*[\"']?[A-Za-z_]+[\"']?\s*:")
 
 
 def _on_shorthand(value: str) -> dict[str, list[str] | None]:
@@ -423,10 +432,35 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     indented under it is orphaned, and reading those keys as the *previous*
     event's filter is how a workflow filtered to ``develop`` reported ``main``
     and passed — the misattribution is silent when the commented event is not one
-    of the two asserted below. Only a comment at the event indent whose content
-    is a bare key counts, so a note above a filter is left alone. The residual is
-    a comment of exactly that shape — ``  # TODO:`` — sitting between an event
-    and its filter, which hides the filter and reads as unfiltered.
+    of the two asserted below.
+
+    Which comments count and what happens to the keys they orphan are two
+    separate decisions, and collapsing them into one is what made this look like
+    a choice between two silent failures. Recognition is deliberately *loose*
+    (see ``_COMMENTED_EVENT``): a commented event key carrying a trailing note is
+    still a commented event key, and missing one is the direction that fails
+    open. Disposition is what keeps that safe.
+
+    **An orphaned filter key is dropped only when it provably is not the
+    previous event's.** An event carries one ``branches:``, so once that event's
+    own filter has been read, a second one below a comment cannot belong to it —
+    dropping it is not a guess, and the event keeps the specific answer that
+    makes the assertion below say something true. But when the event above is
+    still *bare*, the orphan is genuinely ambiguous: it is either that event's
+    filter with a note wrongly read as a key above it, or the commented event's
+    filter. Nothing in the text distinguishes them. So this refuses, the way
+    ``_scalar`` refuses a block scalar — the two readings fail in opposite
+    directions, one reporting a filter the event may not have and one reading as
+    no filter at all, and *that* one passes.
+
+    The cost is stated rather than papered over, because it is the cry-wolf
+    direction this docstring argues against everywhere else: a correct workflow
+    whose only fault is a note at the event indent, shaped like a key, sitting
+    between an event and its first filter will stop the suite. It is narrow — a
+    note one space further in is untouched, which is where notes about a filter
+    normally sit — and the message names the fix. It is a refusal rather than a
+    failed assertion for that reason: it says what cannot be read, instead of
+    claiming the filter is missing.
     """
     filters: dict[str, list[str] | None] = {}
     unproven: set[str] = set()
@@ -457,6 +491,10 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     )
 
     current: str | None = None
+    # The event `current` held when a comment ended it. Kept rather than
+    # discarded because whether its filter had already been read is what decides
+    # if the keys below the comment are ambiguous or merely orphaned.
+    suspended: str | None = None
     for line in lines[start + 1:]:
         if not line.strip():
             continue
@@ -467,13 +505,14 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
             # above is real and its filter is then reported as something it is
             # not.
             if _COMMENTED_EVENT.match(line):
-                current = None
+                suspended, current = current, None
             continue
         if not line.startswith(" "):
             break
         event = _EVENT_KEY.match(line)
         if event:
             current = event.group(1)
+            suspended = None
             filters.setdefault(current, None)  # no filter seen yet
             # `pull_request:` and `pull_request: null` are the same event with
             # no filters — the null tokens as `_scalar` reads them. Anything
@@ -484,11 +523,26 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
             if inline_value and inline_value not in ("~", "null", "Null", "NULL"):
                 unproven.add(current)
             continue
-        if current is None:
-            continue
         key = key_pattern.match(line)
         if not key:
             continue
+        if current is None:
+            # Orphaned: a filter key under a comment this read as an event key.
+            # Safe to drop once the event above has an answer of its own, since
+            # an event carries one `branches:` and this cannot be it.
+            if suspended is not None and (
+                filters.get(suspended) is not None or suspended in unproven
+            ):
+                continue
+            raise ValueError(
+                f"{workflow}: `{line.strip()}` is indented under a commented-out "
+                "event key, and the event above it declares no filter of its "
+                "own, so this parser cannot tell which of the two it filters.\n"
+                "Refused rather than guessed at: read as the live event's, it "
+                "reports a filter that event may not have; dropped, it reads as "
+                "no filter at all — and no filter passes this check. Move the "
+                "note off the event indent, or delete the commented-out block."
+            )
         name, value = key.group(1), _strip_comment(key.group(2))
         inline = re.fullmatch(r"\[(.*)\]", value)
         if name == "branches" and inline:
@@ -1058,17 +1112,80 @@ class TestGuardIsNotVacuous:
         )
         assert _trigger_branches(workflow) == {"pull_request": ["develop"]}
 
-    def test_an_ordinary_comment_does_not_end_the_event(self, tmp_path):
-        # The other half: only a bare key at the event indent counts. A note
-        # above a filter, or one carrying a sentence, must leave the filter
-        # attached — dropping it would read as unfiltered, which passes.
-        for note in ("    # only the pivot", "  # TODO: restore the other one"):
+    def test_a_commented_out_event_is_recognised_through_a_trailing_note(self, tmp_path):
+        # The case above, one trailing comment over. Requiring nothing after the
+        # colon missed a disabled event annotated with why it is disabled, which
+        # is how most of them are written — and a missed one hands `[main]` to
+        # `pull_request` and passes on a workflow that only runs on `develop`.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request:\n"
+            "    branches: [develop]\n"
+            "  # workflow_run:  # off for now\n"
+            "    branches: [main]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {"pull_request": ["develop"]}
+
+    def test_a_note_below_the_event_indent_does_not_end_the_event(self, tmp_path):
+        # Recognition is loose, but not unbounded. A note where notes about a
+        # filter actually sit — one level in from the event — must leave the
+        # filter attached, and so must one carrying no colon at all. Dropping
+        # either would read as unfiltered, which passes.
+        for note in ("    # only the pivot", "  # restore the other one later"):
             workflow = tmp_path / "w.yml"
             workflow.write_text(
                 f"on:\n  pull_request:\n{note}\n    branches: [main]\njobs:\n",
                 encoding="utf-8",
             )
             assert _trigger_branches(workflow) == {"pull_request": ["main"]}, note
+
+    def test_an_ambiguous_orphan_is_refused_rather_than_guessed_at(self, tmp_path):
+        # A note at the event indent that happens to parse as a key, sitting
+        # between a bare event and its filter. The filter below is either that
+        # event's or the commented one's, and nothing in the text says which.
+        #
+        # Refused because the two readings fail in opposite directions and one
+        # of them passes: dropping the filter leaves `pull_request` looking
+        # unfiltered, which covers every branch, which covers the protected one.
+        # This is the cry-wolf cost of reading comments at all — the workflow
+        # below is legal YAML and its filter is written perfectly well.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request:\n"
+            "  # TODO:\n"
+            "    branches: [develop]\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="commented-out event key"):
+            _trigger_branches(workflow)
+
+    def test_an_orphan_is_dropped_once_the_event_has_a_filter_of_its_own(self, tmp_path):
+        # The other side of that refusal, and the reason it is conditional. An
+        # event carries one `branches:`, so once it has been read the orphan
+        # provably is not its filter and dropping it is not a guess.
+        #
+        # Worth its own case because refusing here too would cost the specific
+        # message — `develop` does not cover `main` — and replace it with one
+        # that only says the file could not be read.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request:\n"
+            "    paths: ['src/**']\n"
+            "  # workflow_run:\n"
+            "    branches: [main]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        # `paths:` already made it unproven; the orphan must not overwrite that.
+        assert _trigger_branches(workflow) == {"pull_request": []}
 
     def test_an_unreadable_filter_beats_a_readable_one_on_the_same_event(self, tmp_path):
         # Order-independence, asserted in both directions. An event filtered by
