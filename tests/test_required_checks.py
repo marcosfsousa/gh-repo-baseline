@@ -555,6 +555,16 @@ _ON_KEY = re.compile(r"^[\"']?on[\"']?\s*:\s*(.*)$")
 # sits at the block's indent and a filter key below it, whatever that indent
 # turns out to be.
 
+# A block sequence item: a dash followed by whitespace or nothing. The space is
+# the whole of what makes it a sequence — `-pull_request` is the plain scalar
+# "-pull_request", not an item holding `pull_request`, and reading it as one
+# turned a workflow GitHub never runs into a recognised trigger that passes.
+# The indent is captured so the caller can require one consistent depth: a
+# deeper `- ` does not open a nested sequence here, it continues the plain
+# scalar above it.
+_SEQUENCE_ITEM = re.compile(r"^( *)-(?:\s+(.*)|\s*)$")
+
+
 def _block(lines: list[str]) -> list[str]:
     """
     The lines of an indented block, from just below its key to the next
@@ -566,6 +576,13 @@ def _block(lines: list[str]) -> list[str]:
     dropped that way reads as absent — which is the direction that passes, on a
     workflow whose only fault is a note written flush left.
 
+    **Nor does a sequence item at column zero**, which is not the edge case it
+    looks like: YAML lets a block sequence sit at its key's own indent, and that
+    is the spelling every serialiser emits. Treated as the next top-level key it
+    ended the block immediately, leaving nothing to read and the guard reporting
+    a workflow that declares no trigger — on the most ordinary way there is to
+    write one.
+
     One reader for both passes below, so the pass that measures the block's
     indent and the pass that classifies its keys cannot disagree about where the
     block stops.
@@ -574,7 +591,11 @@ def _block(lines: list[str]) -> list[str]:
     for line in lines:
         if not line.strip():
             continue
-        if not line.startswith(" ") and not line.lstrip().startswith("#"):
+        if (
+            not line.startswith(" ")
+            and not line.lstrip().startswith("#")
+            and not _SEQUENCE_ITEM.match(line)
+        ):
             break
         block.append(line)
     return block
@@ -678,6 +699,86 @@ def _on_shorthand(value: str) -> dict[str, list[str] | None]:
     return {name: None for name in names}
 
 
+def _on_block(block: list[str]) -> dict[str, list[str] | None]:
+    """
+    The events of a block ``on:`` that holds no mapping keys at all.
+
+    A block ``on:`` is usually a mapping of events, and every event pattern here
+    is built for one. It does not have to be. Both shorthands ``_on_shorthand``
+    reads beside the key can be written under it instead — a sequence of event
+    names, or a single bare name:
+
+    .. code-block:: yaml
+
+        on:                  on:
+          - push               pull_request
+          - pull_request
+
+    Both are ordinary YAML and GitHub runs both. Here they held no keys, so the
+    block measured as empty and the result came back ``{}`` — which the assertion
+    below reports as a workflow that "declares no ``on.pull_request`` trigger at
+    all", on a file that declares it plainly. Fail-closed and still false, and it
+    sends the reader to add a trigger already there: the same wrong message the
+    shorthands beside the key used to produce, reached one step further in.
+
+    ``None`` rather than ``[]``, and that is *provable* here for the reason it is
+    in ``_on_shorthand``: neither shape has anywhere to put a branch filter. A
+    sequence item that carried one would be a mapping, and a plain scalar cannot
+    carry anything. So this leniency is not the fail-open direction — there is no
+    filter to fail to see.
+
+    ``{}`` is kept for the one shape it is true of: nothing under the key at all.
+    ``on:`` with an empty block declares no events, and reporting the wanted one
+    as missing is then accurate.
+
+    A single line is handed to ``_on_shorthand`` rather than read here, because
+    it is the same question one indent over: ``on:`` / ``[push, pull_request]``
+    is the flow sequence that function already reads, and ``on:`` / ``{…}`` is
+    the flow mapping it already refuses for being able to carry a filter. One
+    reader for both spellings, so they cannot come to differ.
+
+    Anything else is refused rather than read as empty. Two plain scalars on
+    consecutive lines are one folded scalar and not two events; a block mixing
+    sequence items with something else is not YAML this should guess at.
+    Refusing is the loud direction, and the shape is rare enough to cost nothing.
+
+    **The item shape is read strictly**, which is the one place leniency here
+    would be the fail-open direction rather than a kindness. A dash binds as a
+    sequence indicator only when whitespace follows it, so ``-pull_request`` is
+    the plain scalar ``"-pull_request"`` — an event GitHub does not have, on a
+    workflow it will not run. And items must share one indent: a deeper ``- ``
+    continues the plain scalar above it instead of nesting, so ``- push`` with
+    ``- pull_request`` below it at four spaces is the single scalar
+    ``"push - pull_request"``. Read loosely, both resolved to real event names
+    with no filter, which passes — a workflow whose checks never report,
+    vouched for by the guard that exists to catch exactly that.
+    """
+    content = [line for line in block if not line.lstrip().startswith("#")]
+    if not content:
+        return {}
+
+    items = [_SEQUENCE_ITEM.match(line) for line in content]
+    if all(items):
+        names = [_strip_comment(item.group(2) or "").strip("'\"") for item in items]
+        if len({len(item.group(1)) for item in items}) > 1:
+            names = []  # one folded scalar, not a sequence
+    elif len(content) == 1:
+        return _on_shorthand(_strip_comment(content[0]))
+    else:
+        names = []
+
+    if not names or any(not re.fullmatch(r"[A-Za-z_]+", name) for name in names):
+        raise ValueError(
+            "`on:` opens a block this parser does not read:\n"
+            + "\n".join(content)
+            + "\nA block `on:` is a mapping of events, a sequence of event "
+            "names, or one bare event name. Anything else is refused rather "
+            "than read as declaring no events, because that reads as a missing "
+            "trigger and the file may well declare the one it is asked for."
+        )
+    return {name: None for name in names}
+
+
 def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     """
     ``{event: branch filter}`` from the workflow's ``on:`` block, where ``None``
@@ -740,6 +841,13 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     the same reason: absent and unreadable are different answers, and the message
     a person reads has to say which one this is.
 
+    **A block ``on:`` does not have to be a mapping**, and the two shapes that
+    are not one reached that same false message from one step further in. Both
+    shorthands can be written *under* the key rather than beside it — a sequence
+    of event names, or one bare name — and a block holding no mapping keys was
+    read as a block holding no events. ``_on_block`` reads them, and ``{}`` is
+    kept for the one shape it is true of: nothing under the key at all.
+
     **A commented-out event key ends the event it commented out.** Anything left
     indented under it is orphaned, and reading those keys as the *previous*
     event's filter is how a workflow filtered to ``develop`` reported ``main``
@@ -749,7 +857,7 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     Which comments count and what happens to the keys they orphan are two
     separate decisions, and collapsing them into one is what made this look like
     a choice between two silent failures. Recognition is deliberately *loose*
-    (see ``_COMMENTED_EVENT``): a commented event key carrying a trailing note is
+    (see ``_commented_event``): a commented event key carrying a trailing note is
     still a commented event key, and missing one is the direction that fails
     open. Disposition is what keeps that safe.
 
@@ -813,10 +921,15 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     block = _block(lines[start + 1:])
     indent = _event_indent(block)
     if indent is None:
-        # A block with no keys under it declares no events, and an empty result
-        # says exactly that. The assertion downstream then reports the event it
-        # wanted as missing, which is true.
-        return filters
+        # No mapping keys under the block. That is not the same as no events:
+        # `on:` written as a sequence, or as one bare name, has none either and
+        # declares them plainly. Returning `{}` for all three reported a trigger
+        # the file carries as absent — see `_on_block`, which keeps `{}` for the
+        # empty block it is true of and refuses what it cannot classify.
+        try:
+            return _on_block(block)
+        except ValueError as exc:
+            raise ValueError(f"{workflow}: {exc}") from None
     event_key = _event_key(indent)
     commented_event = _commented_event(indent)
     key_pattern = _filter_key(indent)
@@ -1718,6 +1831,70 @@ class TestGuardIsNotVacuous:
             workflow.write_text(text, encoding="utf-8")
             assert _trigger_branches(workflow) == expected, text
 
+    def test_the_shorthand_forms_are_read_under_the_key_too(self, tmp_path):
+        # The same two shorthands written as a block. Both are ordinary YAML
+        # that GitHub runs, and neither holds a mapping key — so the block
+        # measured as empty and the guard reported "declares no
+        # `on.pull_request` trigger at all" on a file that declares it on the
+        # line above. Fail-closed and false, which sends the reader to add a
+        # trigger already there.
+        shapes = {
+            "on:\n  - push\n  - pull_request\njobs:\n":
+                {"push": None, "pull_request": None},
+            # At the key's own indent, which is what every YAML serialiser
+            # emits and the spelling most likely to be met in the wild. Read as
+            # a top-level key it ended the block on its first line.
+            "on:\n- push\n- pull_request\njobs:\n":
+                {"push": None, "pull_request": None},
+            "on:\n  pull_request\njobs:\n": {"pull_request": None},
+            # The flow sequence one indent over from where `_on_shorthand`
+            # reads it. Same shape, same answer, or the two spellings differ.
+            "on:\n  [push, pull_request]\njobs:\n":
+                {"push": None, "pull_request": None},
+            "on:\n  - pull_request  # only this one for now\njobs:\n":
+                {"pull_request": None},
+            "on:\n  # - push\n  - pull_request\njobs:\n": {"pull_request": None},
+        }
+        for text, expected in shapes.items():
+            workflow = tmp_path / "w.yml"
+            workflow.write_text(text, encoding="utf-8")
+            assert _trigger_branches(workflow) == expected, text
+
+    def test_an_on_block_with_nothing_under_it_declares_no_events(self, tmp_path):
+        # The one shape `{}` is true of, and the reason the branch above it is
+        # not simply deleted. `on:` with an empty block declares no events, so
+        # reporting the wanted one as missing is accurate rather than false —
+        # which is what separates this from the two shapes beside it.
+        for text in ("on:\njobs:\n", "on:\n  # everything is off\njobs:\n"):
+            workflow = tmp_path / "w.yml"
+            workflow.write_text(text, encoding="utf-8")
+            assert _trigger_branches(workflow) == {}, text
+
+    def test_a_block_on_that_is_neither_mapping_nor_sequence_is_refused(self, tmp_path):
+        # Two plain scalars on consecutive lines are one folded scalar, not two
+        # events, and a sequence item mixed with something else is not a shape
+        # to guess at. Refused rather than read as empty: empty reads as a
+        # missing trigger, and the file may well declare the one it is asked for.
+        #
+        # The last two are the fail-open direction rather than the noisy one,
+        # and are why the item shape is matched strictly. A dash is a sequence
+        # indicator only when whitespace follows, so `-pull_request` is the
+        # scalar `"-pull_request"`; and a deeper `- ` continues the scalar above
+        # it rather than nesting, so those two lines are `"push - pull_request"`.
+        # Read loosely, both yielded real event names carrying no filter, which
+        # passes — on workflows GitHub will not run at all.
+        for text in (
+            "on:\n  push\n  pull_request\njobs:\n",
+            "on:\n  - push\n  pull_request\njobs:\n",
+            "on:\n  - {pull_request: {branches: [develop]}}\njobs:\n",
+            "on:\n  -pull_request\njobs:\n",
+            "on:\n  - push\n    - pull_request\njobs:\n",
+        ):
+            workflow = tmp_path / "w.yml"
+            workflow.write_text(text, encoding="utf-8")
+            with pytest.raises(ValueError, match="does not read"):
+                _trigger_branches(workflow)
+
     def test_an_on_block_this_parser_cannot_read_is_refused(self, tmp_path):
         # A flow mapping is the one shorthand that *can* carry a filter, so it
         # is the one that must not be guessed at. Loud, like a block-scalar
@@ -1819,13 +1996,16 @@ class TestGuardIsNotVacuous:
             _trigger_branches(workflow)
 
     def test_an_orphan_is_dropped_once_the_event_has_a_filter_of_its_own(self, tmp_path):
-        # The other side of that refusal, and the reason it is conditional. An
-        # event carries one `branches:`, so once it has been read the orphan
-        # provably is not its filter and dropping it is not a guess.
+        # The other side of that refusal, and the reason it is conditional.
+        # This is the *unproven* arm of the two: `paths:` has already reduced
+        # `pull_request` to `[]`, the most conservative answer there is, so no
+        # reading of the orphan can make it worse and dropping it is not a
+        # guess. The arm keyed on a repeated filter name is the other one, and
+        # it is exercised by test_a_run_of_commented_lines_keeps_the_event_it_ended.
         #
-        # Worth its own case because refusing here too would cost the specific
-        # message — `develop` does not cover `main` — and replace it with one
-        # that only says the file could not be read.
+        # Worth its own case because refusing here too would cost a specific
+        # answer and replace it with a message that only says the file could
+        # not be read.
         workflow = tmp_path / "w.yml"
         workflow.write_text(
             "on:\n"
