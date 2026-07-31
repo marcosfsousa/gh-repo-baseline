@@ -331,14 +331,25 @@ _FILTER_KEYS = ("branches-ignore", "branches", "paths-ignore", "paths")
 # `on` as the boolean true, and a repo bitten by that writes `"on":` instead.
 _ON_KEY = re.compile(r"^[\"']?on[\"']?\s*:\s*(.*)$")
 
-# An event under a block `on:`. What follows the colon is captured rather than
-# required to be empty — an event written inline is still an event, and saying
-# so is the difference between "unreadable" and "absent".
-_EVENT_KEY = re.compile(r"^  [\"']?([A-Za-z_]+)[\"']?\s*:\s*(.*)$")
+# An event under a block `on:`, at the indent the block turned out to use. What
+# follows the colon is captured rather than required to be empty — an event
+# written inline is still an event, and saying so is the difference between
+# "unreadable" and "absent".
+#
+# Anchored to one indent rather than matched anywhere, and that is load-bearing
+# rather than laziness: `types:` under `pull_request:` is `[A-Za-z_]+:` too, so
+# an event pattern that matched at any depth would read it as an event, move
+# `current` onto it, and hand the `branches:` line below it to *that* — leaving
+# the real event unfiltered, which passes. See
+# `test_a_key_nested_under_an_event_is_not_an_event`.
+def _event_key(indent: int) -> re.Pattern[str]:
+    return re.compile(rf"^ {{{indent}}}[\"']?([A-Za-z_]+)[\"']?\s*:\s*(.*)$")
+
 
 # A commented-out event key: at the event indent, and a bare key with nothing
 # after the colon. Deliberately not every comment — see `_trigger_branches`.
-_COMMENTED_EVENT = re.compile(r"^  #+\s*[\"']?[A-Za-z_]+[\"']?\s*:\s*$")
+def _commented_event(indent: int) -> re.Pattern[str]:
+    return re.compile(rf"^ {{{indent}}}#+\s*[\"']?[A-Za-z_]+[\"']?\s*:\s*$")
 
 
 def _on_shorthand(value: str) -> dict[str, list[str] | None]:
@@ -419,6 +430,18 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     the same reason: absent and unreadable are different answers, and the message
     a person reads has to say which one this is.
 
+    **The event indent is read off the block rather than assumed.** Two spaces is
+    the convention and not the rule; a block whose events sit at four matched no
+    event at all and reported the same "declares no ``on.pull_request`` trigger"
+    as a file with no trigger. The first key under ``on:`` is an event — a filter
+    has to sit under one — so its indent fixes the level, and events are matched
+    there exactly. Exactly, because ``types:`` under ``pull_request:`` is a bare
+    key of the same shape: an event pattern that matched at any depth would read
+    it as an event, and the ``branches:`` line below it would then filter *that*
+    instead, leaving the real event unfiltered — which passes. The residual is a
+    block whose events are not all at one indent, where the odd ones out are
+    dropped rather than misread, and dropped is the direction that fails.
+
     **A commented-out event key ends the event it commented out.** Anything left
     indented under it is orphaned, and reading those keys as the *previous*
     event's filter is how a workflow filtered to ``develop`` reported ``main``
@@ -452,9 +475,10 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
         except ValueError as exc:
             raise ValueError(f"{workflow}: {exc}") from None
 
-    key_pattern = re.compile(
-        r"^\s{3,}[\"']?(" + "|".join(_FILTER_KEYS) + r")[\"']?\s*:\s*(.*)$"
-    )
+    event_indent: int | None = None
+    event_key: re.Pattern[str] | None = None
+    commented_event: re.Pattern[str] | None = None
+    key_pattern: re.Pattern[str] | None = None
 
     current: str | None = None
     for line in lines[start + 1:]:
@@ -466,12 +490,36 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
             # to the event above is worse than dropping them, because the event
             # above is real and its filter is then reported as something it is
             # not.
-            if _COMMENTED_EVENT.match(line):
+            #
+            # Before the first event there is nothing to forget, and no indent to
+            # judge the comment against.
+            if commented_event is not None and commented_event.match(line):
                 current = None
             continue
         if not line.startswith(" "):
             break
-        event = _EVENT_KEY.match(line)
+        if event_indent is None:
+            # The first key under `on:` is an event, by construction — a filter
+            # has to sit under one — so its indent is this block's event level.
+            # Two spaces is the convention rather than the rule, and a block
+            # written at four matched nothing at all: the guard then reported
+            # that the workflow "declares no `on.pull_request` trigger at all",
+            # which is false about a file that declares one. Fail-closed, so
+            # noise rather than risk, but the message sends the reader to add a
+            # trigger that is already there.
+            event_indent = len(line) - len(line.lstrip(" "))
+            event_key = _event_key(event_indent)
+            commented_event = _commented_event(event_indent)
+            # Filter keys stay matched by *name*, at any indent deeper than the
+            # event — the tolerance the paragraph above calls safety-critical.
+            # For the conventional two-space block this is `\s{3,}`, exactly what
+            # it was when the indent was hardcoded.
+            key_pattern = re.compile(
+                rf"^\s{{{event_indent + 1},}}[\"']?("
+                + "|".join(_FILTER_KEYS)
+                + r")[\"']?\s*:\s*(.*)$"
+            )
+        event = event_key.match(line)
         if event:
             current = event.group(1)
             filters.setdefault(current, None)  # no filter seen yet
@@ -994,6 +1042,47 @@ class TestGuardIsNotVacuous:
                 f"on:\n  pull_request:\n{filter_line}\njobs:\n", encoding="utf-8"
             )
             assert _trigger_branches(workflow) == {"pull_request": ["develop"]}, label
+
+    def test_an_on_block_indented_past_the_convention_is_still_read(self, tmp_path):
+        # Two spaces is the convention, not the rule. At four, the event key
+        # matched nothing and the guard said the workflow "declares no
+        # `on.pull_request` trigger at all" — false about a file that declares
+        # one, and it sends the reader to add a trigger that is already there.
+        # Fail-closed, so this is the noisy direction rather than the silent one,
+        # which is why it is the last member of this class to be closed.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "    pull_request:\n"
+            "      branches: [develop]\n"
+            "    push:\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {
+            "pull_request": ["develop"], "push": None,
+        }
+
+    def test_a_key_nested_under_an_event_is_not_an_event(self, tmp_path):
+        # Why the event indent is read off the block and then matched exactly,
+        # rather than the event key simply being matched at any indent the way
+        # the filter keys are. `types:` is a bare key of the same shape one level
+        # down. Matched as an event it would take `current`, the `branches:`
+        # below would filter *it*, and `pull_request` would come back unfiltered
+        # — covering every branch, therefore the protected one, therefore
+        # passing, on a workflow whose pull requests only ever run on `develop`.
+        # That is the fail-open direction, reached from the fix for a fail-closed
+        # one.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request:\n"
+            "    types: [opened, synchronize]\n"
+            "    branches: [develop]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {"pull_request": ["develop"]}
 
     def test_the_shorthand_forms_of_on_are_read(self, tmp_path):
         # Neither shorthand can carry a branch filter, so `None` here is proved
