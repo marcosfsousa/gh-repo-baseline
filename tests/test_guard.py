@@ -6,7 +6,7 @@
 That file is a guard, and a guard that cannot go red is not a guard. Asserting it
 passes on a correct repo proves almost nothing — a file containing no assertions
 at all would do the same. So this suite assembles a throwaway repo out of
-``templates/``, checks the guard passes, and then breaks the repo sixteen
+``templates/``, checks the guard passes, and then breaks the repo seventeen
 different ways and checks the guard fails **on exactly the intended tests and no
 others**.
 
@@ -235,16 +235,27 @@ class TestTheGuardPasses:
         words = {
             8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
             13: "thirteen", 14: "fourteen", 15: "fifteen", 16: "sixteen",
+            17: "seventeen", 18: "eighteen", 19: "nineteen", 20: "twenty",
         }
-        assert stated.group(1) == words[len(MUTATIONS)], (
+        # Read out rather than indexed, because a count past the end of the
+        # table is the ordinary way this test is reached — adding a mutation is
+        # what moves the number — and a bare KeyError names neither the file to
+        # edit nor the reason.
+        expected = words.get(len(MUTATIONS))
+        assert expected, (
+            f"MUTATIONS has {len(MUTATIONS)} entries and this test cannot spell "
+            "that number.\nAdd it to `words` above; the README states the count "
+            "in prose, so it has to be compared as a word."
+        )
+        assert stated.group(1) == expected, (
             f"README.md says the guard is broken {stated.group(1)!r} ways; "
             f"MUTATIONS has {len(MUTATIONS)} entries "
-            f"({words[len(MUTATIONS)]!r}).\nUpdate the README, and the list of "
+            f"({expected!r}).\nUpdate the README, and the list of "
             "mutations it enumerates alongside the number."
         )
 
 
-# ── The guard on sixteen broken repos ────────────────────────────────────────
+# ── The guard on seventeen broken repos ──────────────────────────────────────
 #
 # Each entry is (label, mutation, the exact set of tests that must fail).
 
@@ -326,6 +337,27 @@ MUTATIONS = [
         # assertion catches downstream. Kept end-to-end rather than left to the
         # unit test because that default is reached through the guard's own
         # assertion, not through the parser's return value alone.
+    ),
+    pytest.param(
+        lambda root: _edit_workflow(
+            root,
+            "  pull_request:\n    branches: [main]",
+            "  pull_request:\n    branches: [develop]\n"
+            "  # workflow_run:  # off for now\n    branches: [main]",
+        ),
+        {"test_ci_runs_on_the_protected_branch"},
+        id="a-commented-out-event-lends-its-filter-to-the-live-one",
+        # The third of the fail-open shapes that has to be reached end-to-end.
+        # The keys under a commented-out event are orphaned, and reading them as
+        # the *previous* event's filter is silent: `pull_request` is filtered to
+        # `develop` and reports as covering `main`, which passes. Nothing in the
+        # parser's return value says it happened — the wrong answer is a
+        # perfectly ordinary list — so, like the mutation above, the only place
+        # it shows is through the guard's own assertion.
+        #
+        # The trailing note is not decoration. A disabled event is normally
+        # annotated with why, and a recogniser requiring nothing after the colon
+        # misses exactly that shape, which is what hands `[main]` over.
     ),
     pytest.param(
         lambda root: _require_context(root, "security / codeql"),
