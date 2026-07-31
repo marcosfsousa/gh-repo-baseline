@@ -151,6 +151,41 @@ class TestJobContexts:
         )
         assert boot._job_contexts(workflow) == ["The gate"]
 
+    @pytest.mark.parametrize("null", ["null", "~", "Null", "NULL", "null  # none"])
+    def test_a_null_strategy_is_not_an_inline_one(self, boot, tmp_path, null):
+        # The inline refusal reads any value after `strategy:` as a flow mapping
+        # with a matrix hidden in it. A null has no block below it, so there is
+        # no matrix it could be hiding, and stopping to announce one refuses a
+        # workflow GitHub runs. Same tokens `_scalar` already treats as null.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            f"jobs:\n  pytest:\n    strategy: {null}\n    name: The gate\n",
+            encoding="utf-8",
+        )
+        assert boot._job_contexts(workflow) == ["The gate"]
+
+    def test_a_quoted_null_strategy_is_still_refused(self, boot, tmp_path):
+        # Quoted, `null` is an ordinary string and not a null, so the value is a
+        # value and this stops -- the asymmetry `_scalar` already keeps between
+        # `name: null` and `name: 'null'`.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  pytest:\n    strategy: 'null'\n    name: The gate\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit, match="inline value"):
+            boot._job_contexts(workflow)
+
+    def test_a_null_jobs_block_is_empty_rather_than_unreadable(self, boot, tmp_path):
+        # `jobs: null` is a workflow with no jobs, and the tool must stop on it
+        # -- deriving zero contexts writes a ruleset that requires nothing. What
+        # it must not do is stop with the flow-mapping message, sending the
+        # reader to look for braces that were never written.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text("jobs: ~\n", encoding="utf-8")
+        with pytest.raises(SystemExit, match="no jobs were collected"):
+            boot._job_contexts(workflow)
+
     def test_a_matrix_is_refused_wherever_the_job_puts_it(self, boot, tmp_path):
         # The refusal keyed on `strategy:` at exactly four spaces and `matrix:`
         # at exactly six, unquoted. Everything below is ordinary YAML that
@@ -407,6 +442,20 @@ class TestBothParserCopiesAgree:
         "jobs: {build: {name: The gate}}\n",
         "jobs:\n  build:\n    name: B\n    steps:\n      - uses: ./a\n"
         "        with:\n          matrix: not-a-strategy\n",
+        # The null tokens, where the two copies now have to agree about *not*
+        # refusing. A copy still reading these as a flow mapping stops on a
+        # workflow the other one parses, which is the same drift as before with
+        # the sign flipped: the guard would refuse what the tool required.
+        "jobs:\n  pytest:\n    strategy: null\n    name: The gate\n",
+        "jobs:\n  pytest:\n    strategy: ~\n    name: The gate\n",
+        "jobs:\n  pytest:\n    strategy: 'null'\n    name: The gate\n",
+        # `jobs: ~` is deliberately absent. Neither copy refuses it as a flow
+        # mapping any more, which is the fix, but they report the emptiness that
+        # remains through different organs: the tool stops inside the parser, and
+        # the guard returns nothing and lets `test_jobs_are_collected` say so.
+        # Comparing them on *whether the parser refused* would call that
+        # difference drift, and it is the same difference in return type this
+        # class already exists to permit.
     ])
     def test_same_refusals_for_composed_and_unreadable_job_keys(
         self, boot, template_guard, tmp_path, workflow_text

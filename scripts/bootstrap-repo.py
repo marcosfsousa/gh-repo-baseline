@@ -178,6 +178,19 @@ def _strip_comment(value: str) -> str:
     return re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip()
 
 
+# The unquoted spellings of null in YAML's core schema. `NULL` and `Null` are
+# null; `nUll` is not, and is an ordinary string.
+#
+# Named rather than repeated because every place a key's value is inspected has
+# to answer the same question -- is there a value here at all -- and answering it
+# differently in different places is what this fixes. `jobs: null` and
+# `strategy: null` were each read as "carries a value", so a key that says
+# nothing was refused with a message describing a flow mapping that was not
+# there. Quoted, these are strings and keep their value, so the comparison
+# happens after any quotes have been dealt with, never before.
+_NULL_TOKENS = ("~", "null", "Null", "NULL")
+
+
 def _key(line: str) -> tuple[int, str, str] | None:
     """
     ``(indent, key, raw value)`` for a line that is a mapping key, else ``None``.
@@ -287,7 +300,7 @@ def _scalar(value: str) -> str | None:
     # Unquoted, so the null tokens resolve to null and the job id stands. `NULL`
     # and `Null` are null in YAML's core schema; `nUll` is not, and is a string.
     stripped = _strip_comment(value)
-    return None if stripped in ("", "~", "null", "Null", "NULL") else stripped
+    return None if stripped in ("", *_NULL_TOKENS) else stripped
 
 
 def _job_contexts(workflow: Path) -> list[str]:
@@ -315,7 +328,9 @@ def _job_contexts(workflow: Path) -> list[str]:
     block scalar: requiring a context nothing reports leaves a pull request
     pending rather than red. Pass those with ``--check`` instead. A ``strategy:``
     written inline is refused on its value alone -- the matrix inside a flow
-    mapping is just as real and there is no ``matrix:`` line to find.
+    mapping is just as real and there is no ``matrix:`` line to find. The null
+    tokens are the exception and the only one: ``strategy: null`` has no block
+    below it and so no matrix that could exist.
 
     The copy in ``templates/tests/test_required_checks.py`` returns
     ``{job id: context}`` where this returns just the contexts — it needs the id
@@ -333,7 +348,10 @@ def _job_contexts(workflow: Path) -> list[str]:
         key = _key(line)
         if key and key[0] == 0 and key[1] == "jobs":
             inline = _strip_comment(key[2])
-            if inline:
+            # A null is not a value to refuse: `jobs: null` is a workflow with no
+            # jobs, and the check at the end of this function says exactly that.
+            # Refusing here blamed a flow mapping nobody wrote.
+            if inline and inline not in _NULL_TOKENS:
                 sys.exit(
                     f"{workflow}: `jobs:` carries the value {inline!r}.\n"
                     "The jobs block is read by indentation, so a flow mapping is "
@@ -430,7 +448,7 @@ def _job_contexts(workflow: Path) -> list[str]:
             )
         if name == "strategy":
             inline = _strip_comment(value)
-            if inline:
+            if inline and inline not in _NULL_TOKENS:
                 sys.exit(
                     f"{workflow}, job {current!r}: `strategy:` carries the inline "
                     f"value {inline!r}.\nA `matrix:` written inside it composes "
@@ -438,7 +456,10 @@ def _job_contexts(workflow: Path) -> list[str]:
                     "neither out of a flow mapping. Write the strategy as a "
                     "block, or pass each combination with --check."
                 )
-            in_strategy = True
+            # A null strategy has no block below it and therefore no `matrix:` to
+            # find, so there is nothing to enter. It is the one value here that
+            # is provably harmless: refusing it named a matrix that cannot exist.
+            in_strategy = not inline
             continue
         if name == "name":
             try:
