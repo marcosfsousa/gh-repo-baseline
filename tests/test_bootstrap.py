@@ -276,6 +276,36 @@ class TestJobContexts:
         with pytest.raises(SystemExit, match="is not a job id"):
             boot._job_contexts(workflow)
 
+    def test_a_job_id_may_not_open_with_a_digit(self, boot, tmp_path):
+        # The other half of the same rule, and the one shape in this parser that
+        # can refuse a workflow which bootstrapped before the rule was
+        # tightened: `2fa` satisfied the old `[A-Za-z0-9_-]+` and would have been
+        # written into a ruleset as a context. GitHub rejects the workflow
+        # itself, so the refusal costs a run that was never going to happen --
+        # but it is still a refusal, and an undisclosed one is indistinguishable
+        # from a bug to whoever hits it, so it is tested and written down.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text("jobs:\n  2fa:\n    name: A\n", encoding="utf-8")
+        with pytest.raises(SystemExit, match="is not a job id"):
+            boot._job_contexts(workflow)
+
+    def test_whitespace_before_the_colon_is_blamed_on_the_space(self, boot, tmp_path):
+        # Not about *whether* this stops -- it always did, and the old charset
+        # failed on the captured `'build '` too. It is about which fix the
+        # message asks for. YAML reads the id as `build` and GitHub runs the
+        # workflow, so a message about letters and digits sends the reader to
+        # inspect characters that are all fine, which is the failure mode this
+        # repo cares about more than the refusal itself.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text("jobs:\n  build :\n    name: A\n", encoding="utf-8")
+        with pytest.raises(SystemExit) as stopped:
+            boot._job_contexts(workflow)
+        message = str(stopped.value.code)
+        assert "whitespace between the job id" in message
+        assert "GitHub allows letters" not in message, (
+            "the space is being reported as a charset problem again"
+        )
+
     def test_an_underscore_still_opens_a_job_id(self, boot, tmp_path):
         # The other half of the rule above: tightening the first character must
         # not cost the ids GitHub does allow.
@@ -580,6 +610,12 @@ class TestBothParserCopiesAgree:
         # is the true reason and the same reason in both.
         "jobs:\n  |\n  text\n",
         "jobs:\n  -x:\n    name: A\n",
+        # The first character, both directions it can be wrong, and the space
+        # that is not a charset problem at all. Each copy states the rule in its
+        # own message, so this is where a copy that relaxes one of them -- or
+        # keeps blaming the charset for the space -- stops agreeing.
+        "jobs:\n  2fa:\n    name: A\n",
+        "jobs:\n  build :\n    name: A\n",
         # `jobs: ~` is deliberately absent. Neither copy refuses it as a flow
         # mapping any more, which is the fix, but they report the emptiness that
         # remains through different organs: the tool stops inside the parser, and
@@ -593,20 +629,28 @@ class TestBothParserCopiesAgree:
     ):
         # The shapes where the two copies most easily drift, because each refuses
         # through its own mechanism — `ValueError` in the guard, `sys.exit` in the
-        # tool. Compared on *whether* each refuses, so a fix applied to one copy
-        # and not the other is caught here rather than in whichever repo copied
-        # the stale one.
+        # tool. Compared on the *diagnosis*, not merely on whether each stopped:
+        # two copies that refuse the same input for different reasons have
+        # already drifted, and the reader of the stale copy is sent to fix
+        # something else.
+        #
+        # The diagnosis is the first line. What follows the newline is the
+        # remedy, and it differs between the copies on purpose — the tool can
+        # offer `--check` and the guard, which has no command line, cannot. That
+        # is the one half this comparison deliberately does not enforce.
         workflow = tmp_path / "w.yml"
         workflow.write_text(workflow_text, encoding="utf-8")
 
-        def refused(call):
+        def diagnosis(call):
             try:
                 call()
-            except (ValueError, SystemExit):
-                return True
-            return False
+            except SystemExit as stopped:
+                return str(stopped.code).partition("\n")[0]
+            except ValueError as refused:
+                return str(refused).partition("\n")[0]
+            return None
 
-        assert refused(lambda: template_guard._job_contexts(workflow)) == refused(
+        assert diagnosis(lambda: template_guard._job_contexts(workflow)) == diagnosis(
             lambda: boot._job_contexts(workflow)
         ), workflow_text
 
