@@ -252,11 +252,13 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
     Keyed by id so a failure can name the job whose ``name:`` moved rather than
     only the string that disappeared.
 
-    Job ids sit at two spaces under ``jobs:``. **Everything below one is placed
-    by comparing indents**: the first key under a job fixes the indent that
-    job's own keys sit at, and ``name:``, ``uses:`` and ``strategy:`` count only
-    where they sit at it. Step names are list items and are therefore excluded
-    structurally, not by pattern — see ``test_step_names_are_not_collected``.
+    **Every level is placed by comparing indents, and none is assumed.** The
+    first key-shaped line inside ``jobs:`` fixes the indent the job ids sit at,
+    and the first key under a job fixes the indent that job's own keys sit at —
+    so ``name:``, ``uses:`` and ``strategy:`` count where they sit at the
+    latter, and a job id is a line that sits at the former. Step names are list
+    items and are therefore excluded structurally, not by pattern — see
+    ``test_step_names_are_not_collected``.
 
     Matching each of those keys at a fixed column instead was a fail-open with
     no symptom. Four-space-per-level indentation is ordinary YAML and GitHub
@@ -266,6 +268,13 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
     bare job id that GitHub never reports. A job whose own keys sit at two
     different indents is refused rather than half-read, which is the one shape
     comparing indents can get wrong.
+
+    The job ids kept that fixed column one round longer, and failed the other
+    way when it was wrong: a four-space ``jobs:`` block matched no job at all,
+    which the guard reports as nothing collected rather than as a context it
+    quietly got wrong. Loud, and still worth removing — the assumption was the
+    same one, in the same loop, two lines up from where it had already been
+    given up.
 
     **A job key is recognised by its shape before its id is read**, so a key this
     cannot vouch for stops the parse instead of being skipped. Skipping was two
@@ -335,6 +344,7 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
         )
 
     current: str | None = None
+    jobs_indent: int | None = None  # the indent the job ids themselves sit at
     body: int | None = None      # the indent `current`'s own keys sit at
     strategy: int | None = None  # the indent the keys inside its `strategy:` sit at
     in_strategy = False
@@ -344,13 +354,25 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
         # A non-indented key ends the jobs block.
         if not line.startswith(" "):
             break
-        # Matched on the key *shape* — two spaces, then anything up to a colon —
+        # Matched on the key *shape* — an indent, then anything up to a colon —
         # rather than on the id charset, so an id this cannot read is refused
         # below instead of falling through to the `name:` branch with `current`
         # still naming the previous job.
-        key = re.match(r"^  (\S[^:]*):(.*)$", line)
-        if key:
-            job_id, trailing = key.group(1), _strip_comment(key.group(2))
+        #
+        # The indent is read off the first such line rather than fixed at two,
+        # for the reason the keys below a job are: two is only the common
+        # spelling. A `jobs:` block indented four per level is ordinary YAML that
+        # GitHub runs, and against a fixed column it matched nothing — which
+        # collects no jobs at all. That direction is loud rather than silent, so
+        # it was a limitation and not the fail-open this parser was fixed for,
+        # but it is the same assumption in the same file and it costs nothing to
+        # stop making it. The first key-shaped line inside the block is the first
+        # job: comments and blanks are already skipped above, and a mapping
+        # cannot open with anything else.
+        key = re.match(r"^( +)(?!-(?:\s|$))(\S[^:]*):(.*)$", line)
+        if key and (jobs_indent is None or len(key.group(1)) == jobs_indent):
+            jobs_indent = len(key.group(1))
+            job_id, trailing = key.group(2), _strip_comment(key.group(3))
             if trailing:
                 # A job id maps to a block, so anything left after the comment is
                 # stripped is not a job at all.
@@ -1272,6 +1294,64 @@ class TestGuardIsNotVacuous:
             encoding="utf-8",
         )
         with pytest.raises(ValueError, match="inline value"):
+            _job_contexts(workflow)
+
+    @pytest.mark.parametrize("width", [1, 2, 3, 4, 8])
+    def test_the_jobs_block_may_be_indented_any_width(self, tmp_path, width):
+        # Two spaces is the common spelling of a `jobs:` block, not the required
+        # one. Pinned to two, everything but the middle case here collected no
+        # jobs — the guard then has nothing to compare the ruleset against, and
+        # says so, which is why this was a limitation rather than the fail-open
+        # the keys below a job had. The refusals still have to be reachable at
+        # whatever width the file uses, which is what the next two cases check.
+        pad = " " * width
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            f"jobs:\n"
+            f"{pad}pytest:\n"
+            f"{pad * 2}name: The gate\n"
+            f"{pad * 2}steps:\n"
+            f"{pad * 3}- uses: actions/checkout@v4\n"
+            f"{pad}lint:\n"
+            f"{pad * 2}runs-on: ubuntu-latest\n",
+            encoding="utf-8",
+        )
+        assert _job_contexts(workflow) == {"pytest": "The gate", "lint": "lint"}
+
+    def test_a_matrix_is_refused_at_a_width_the_parser_was_never_pinned_to(self, tmp_path):
+        # The reason the case above is not enough on its own. Reading the ids at
+        # the wrong indent does not misread a job, it drops it — and a dropped
+        # job reaches none of the refusals, so a matrix at four-per-level would
+        # have gone unmentioned rather than wrong.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "    pytest:\n"
+            "        strategy:\n"
+            "            matrix:\n"
+            "                python-version: ['3.11', '3.12']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="matrix job"):
+            _job_contexts(workflow)
+
+    def test_a_job_id_at_the_wrong_indent_does_not_start_a_job(self, tmp_path):
+        # The bound. The first job fixes the width, so a second id written at a
+        # different one does not quietly become a job: it falls through to the
+        # keys of the job above, sits at an indent that job's own keys do not
+        # use, and is refused there. Reading it as a job instead would mean
+        # taking any indent as a job id, which is the fixed column's opposite
+        # error rather than its absence.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  first:\n"
+            "    name: A\n"
+            "   second:\n"
+            "     name: B\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="sits at 3 spaces"):
             _job_contexts(workflow)
 
     def test_a_null_jobs_block_has_no_jobs_rather_than_an_unreadable_one(self, tmp_path):

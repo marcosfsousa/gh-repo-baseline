@@ -312,12 +312,15 @@ def _job_contexts(workflow: Path) -> list[str]:
     manifest the target repo's CI installs, for the benefit of one test. The job
     header is a fixed, shallow shape.
 
-    Job ids sit at two spaces under ``jobs:``; everything below one is placed by
-    comparing indents, because the first key under a job fixes the level that
-    job's own keys sit at. Matching each key at a fixed column instead failed
-    *open*: four-space-per-level indentation is ordinary YAML, it matched
-    nothing, and nothing matched reads as absent -- so a matrix job reached no
-    refusal and a ``name:`` reached no context. Step names are list items and are
+    Every level is placed by comparing indents and none is assumed: the first
+    key-shaped line inside ``jobs:`` fixes the indent the job ids sit at, and
+    the first key under a job fixes the level that job's own keys sit at.
+    Matching each key at a fixed column instead failed *open*: four-space-per-
+    level indentation is ordinary YAML, it matched nothing, and nothing matched
+    reads as absent -- so a matrix job reached no refusal and a ``name:``
+    reached no context. The job ids held that column one round longer and failed
+    the other way when it was wrong, collecting no jobs at all; loud, but the
+    same assumption, and now gone too. Step names are list items and are
     therefore excluded structurally rather than by pattern.
 
     A job key is recognised by its shape before its id is read, so a key this
@@ -370,6 +373,7 @@ def _job_contexts(workflow: Path) -> list[str]:
         )
 
     current: str | None = None
+    jobs_indent: int | None = None  # the indent the job ids themselves sit at
     body: int | None = None      # the indent `current`'s own keys sit at
     strategy: int | None = None  # the indent the keys inside its `strategy:` sit at
     in_strategy = False
@@ -379,13 +383,25 @@ def _job_contexts(workflow: Path) -> list[str]:
         # A non-indented key ends the jobs block.
         if not line.startswith(" "):
             break
-        # Matched on the key *shape* -- two spaces, then anything up to a colon --
+        # Matched on the key *shape* -- an indent, then anything up to a colon --
         # rather than on the id charset, so an id this cannot read is refused
         # below instead of falling through to the `name:` branch with `current`
         # still naming the previous job.
-        key = re.match(r"^  (\S[^:]*):(.*)$", line)
-        if key:
-            job_id, trailing = key.group(1), _strip_comment(key.group(2))
+        #
+        # The indent is read off the first such line rather than fixed at two,
+        # for the reason the keys below a job are: two is only the common
+        # spelling. A `jobs:` block indented four per level is ordinary YAML that
+        # GitHub runs, and against a fixed column it matched nothing -- which
+        # collects no jobs at all. That direction is loud rather than silent, so
+        # it was a limitation and not the fail-open this parser was fixed for,
+        # but it is the same assumption in the same file and it costs nothing to
+        # stop making it. The first key-shaped line inside the block is the first
+        # job: comments and blanks are already skipped above, and a mapping
+        # cannot open with anything else.
+        key = re.match(r"^( +)(?!-(?:\s|$))(\S[^:]*):(.*)$", line)
+        if key and (jobs_indent is None or len(key.group(1)) == jobs_indent):
+            jobs_indent = len(key.group(1))
+            job_id, trailing = key.group(2), _strip_comment(key.group(3))
             if trailing:
                 sys.exit(
                     f"{workflow}: `{job_id}:` sits where a job id belongs but "

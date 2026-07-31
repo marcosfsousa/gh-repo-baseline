@@ -176,6 +176,55 @@ class TestJobContexts:
         with pytest.raises(SystemExit, match="inline value"):
             boot._job_contexts(workflow)
 
+    @pytest.mark.parametrize("width", [1, 2, 3, 4, 8])
+    def test_the_jobs_block_may_be_indented_any_width(self, boot, tmp_path, width):
+        # Two spaces is the common spelling of a `jobs:` block, not the required
+        # one. Pinned to two, every width but the middle one collected no jobs
+        # and the tool stopped -- loud, and still a workflow it could not read.
+        pad = " " * width
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            f"jobs:\n"
+            f"{pad}pytest:\n"
+            f"{pad * 2}name: The gate\n"
+            f"{pad * 2}steps:\n"
+            f"{pad * 3}- uses: actions/checkout@v4\n"
+            f"{pad}lint:\n"
+            f"{pad * 2}runs-on: ubuntu-latest\n",
+            encoding="utf-8",
+        )
+        assert boot._job_contexts(workflow) == ["The gate", "lint"]
+
+    def test_a_matrix_is_refused_at_a_width_the_parser_was_never_pinned_to(
+        self, boot, tmp_path
+    ):
+        # Reading the ids at the wrong indent does not misread a job, it drops
+        # it -- and a dropped job reaches none of the refusals. Without this, a
+        # four-per-level matrix would go unmentioned rather than refused.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "    pytest:\n"
+            "        strategy:\n"
+            "            matrix:\n"
+            "                python-version: ['3.11', '3.12']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit, match="matrix job"):
+            boot._job_contexts(workflow)
+
+    def test_a_job_id_at_the_wrong_indent_does_not_start_a_job(self, boot, tmp_path):
+        # The first job fixes the width, so a second id at a different one is
+        # not quietly a job: it lands among the keys of the job above at an
+        # indent those keys do not use, and is refused there.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  first:\n    name: A\n   second:\n     name: B\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit, match="sits at 3 spaces"):
+            boot._job_contexts(workflow)
+
     def test_a_null_jobs_block_is_empty_rather_than_unreadable(self, boot, tmp_path):
         # `jobs: null` is a workflow with no jobs, and the tool must stop on it
         # -- deriving zero contexts writes a ruleset that requires nothing. What
@@ -449,6 +498,14 @@ class TestBothParserCopiesAgree:
         "jobs:\n  pytest:\n    strategy: null\n    name: The gate\n",
         "jobs:\n  pytest:\n    strategy: ~\n    name: The gate\n",
         "jobs:\n  pytest:\n    strategy: 'null'\n    name: The gate\n",
+        # The widths. A copy still pinned to two spaces collects nothing here
+        # and stops on the count, while the other reads the job and refuses the
+        # matrix — the same input answered by two different mechanisms, which is
+        # exactly the drift this class exists to catch.
+        "jobs:\n    pytest:\n        strategy:\n            matrix:\n"
+        "                v: [1, 2]\n",
+        "jobs:\n first:\n  name: A\n gate:\n  uses: ./.github/workflows/s.yml\n",
+        "jobs:\n  first:\n    name: A\n   second:\n     name: B\n",
         # `jobs: ~` is deliberately absent. Neither copy refuses it as a flow
         # mapping any more, which is the fix, but they report the emptiness that
         # remains through different organs: the tool stops inside the parser, and
@@ -487,6 +544,10 @@ class TestBothParserCopiesAgree:
         "        with:\n          matrix: not-a-strategy\n",
         "jobs:\n  pytest:\n      strategy:\n          fail-fast: false\n"
         "      name: The gate\n",
+        # Widths both copies must now read alike, not merely stop on alike.
+        "jobs:\n    build:\n        name: The gate\n",
+        "jobs:\n build:\n  name: The gate\n",
+        "jobs:\n  pytest:\n    strategy: null\n    name: The gate\n",
     ])
     def test_same_contexts_for_shapes_that_are_read_rather_than_refused(
         self, boot, template_guard, tmp_path, workflow_text
