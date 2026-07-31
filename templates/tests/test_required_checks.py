@@ -435,23 +435,113 @@ _FILTER_KEYS = ("branches-ignore", "branches", "paths-ignore", "paths")
 # `on` as the boolean true, and a repo bitten by that writes `"on":` instead.
 _ON_KEY = re.compile(r"^[\"']?on[\"']?\s*:\s*(.*)$")
 
-# An event under a block `on:`. What follows the colon is captured rather than
-# required to be empty — an event written inline is still an event, and saying
-# so is the difference between "unreadable" and "absent".
-_EVENT_KEY = re.compile(r"^  [\"']?([A-Za-z_]+)[\"']?\s*:\s*(.*)$")
-
-# A commented-out event key: at the event indent, and shaped like a key. What
-# follows the colon is not constrained, because a disabled event is commonly
-# disabled with a note saying why — `# workflow_run:  # off for now`. Requiring
-# nothing after the colon missed exactly that shape, and a missed one hands its
-# orphaned keys to the live event above as if they were its filter.
+# The three patterns below are built from the indent the `on:` block actually
+# uses, rather than from the two spaces it usually uses. All three carried that
+# constant separately — the event patterns matched exactly two spaces and the
+# filter pattern matched three or more, which is the same number written as
+# "deeper than an event" — so a block written four-per-level defeated all three
+# at once. That is ordinary YAML and GitHub runs it. Here its events matched
+# nothing, and with nothing recognised as an event either the block came back
+# empty and the guard reported a workflow that "declares no `on.pull_request`
+# trigger at all", or its filter arrived with no event to attach to and was
+# refused as orphaned under a commented-out event key that is not there. Both
+# messages are false, and both send the reader to fix a file that is correct.
 #
-# Over-matching is the safe direction here and under-matching is not, which is
-# why this is loose. A comment this wrongly reads as an event key can only
-# orphan the keys below it, and `_trigger_branches` refuses rather than guesses
-# when an orphan is ambiguous. Still deliberately not every comment: a note with
-# no colon leaves the event alone, and so does anything below the event indent.
-_COMMENTED_EVENT = re.compile(r"^  #+\s*[\"']?[A-Za-z_]+[\"']?\s*:")
+# Reading the indent instead is also what stops the two ends colliding: an event
+# sits at the block's indent and a filter key below it, whatever that indent
+# turns out to be.
+
+def _block(lines: list[str]) -> list[str]:
+    """
+    The lines of an indented block, from just below its key to the next
+    top-level one. Blank lines are dropped; comments are kept, because one of
+    them may be a commented-out event key.
+
+    **A comment does not end the block wherever it sits**, including at column
+    zero. Ending it there would drop every line below the comment, and a filter
+    dropped that way reads as absent — which is the direction that passes, on a
+    workflow whose only fault is a note written flush left.
+
+    One reader for both passes below, so the pass that measures the block's
+    indent and the pass that classifies its keys cannot disagree about where the
+    block stops.
+    """
+    block: list[str] = []
+    for line in lines:
+        if not line.strip():
+            continue
+        if not line.startswith(" ") and not line.lstrip().startswith("#"):
+            break
+        block.append(line)
+    return block
+
+
+def _event_indent(lines: list[str]) -> int | None:
+    """
+    The indent the events of a block ``on:`` sit at, given the block's lines, or
+    ``None`` when the block holds no keys at all.
+
+    The **smallest** indent any key under the block sits at, not the first one.
+    They differ on exactly one shape and it is a shape this file already has an
+    answer for: a filter orphaned under a commented-out event key, above the
+    first live event. Taking the first key would fix the block's indent at that
+    orphan's depth, leaving every real event below it looking mis-indented and
+    unrecognised — a fail-open reached from a file whose only fault is a
+    commented-out block at the top. The smallest keeps the orphan an orphan, and
+    ``_trigger_branches`` already decides those deliberately.
+
+    Read with ``_key``, so a block list item cannot fix the indent: ``- main``
+    under a ``branches:`` is a value, not a key, and reading it as one would put
+    the block's indent two levels too deep.
+    """
+    indents = [
+        key[0]
+        for line in lines
+        if not line.lstrip().startswith("#") and (key := _key(line))
+    ]
+    return min(indents, default=None)
+
+
+def _event_key(indent: int) -> re.Pattern[str]:
+    """
+    An event at the block's own indent. What follows the colon is captured
+    rather than required to be empty — an event written inline is still an
+    event, and saying so is the difference between "unreadable" and "absent".
+    """
+    return re.compile(rf"^{' ' * indent}[\"']?([A-Za-z_]+)[\"']?\s*:\s*(.*)$")
+
+
+def _commented_event(indent: int) -> re.Pattern[str]:
+    """
+    A commented-out event key: at the event indent, and shaped like a key. What
+    follows the colon is not constrained, because a disabled event is commonly
+    disabled with a note saying why — ``# workflow_run:  # off for now``.
+    Requiring nothing after the colon missed exactly that shape, and a missed one
+    hands its orphaned keys to the live event above as if they were its filter.
+
+    Over-matching is the safe direction here and under-matching is not, which is
+    why this is loose. A comment this wrongly reads as an event key can only
+    orphan the keys below it, and ``_trigger_branches`` refuses rather than
+    guesses when an orphan is ambiguous. Still deliberately not every comment: a
+    note with no colon leaves the event alone, and so does anything below the
+    event indent.
+    """
+    return re.compile(rf"^{' ' * indent}#+\s*[\"']?[A-Za-z_]+[\"']?\s*:")
+
+
+def _filter_key(indent: int) -> re.Pattern[str]:
+    """
+    A filter key anywhere below the event indent, matched by name.
+
+    Deliberately tolerant about depth and quoting for the reason
+    ``_trigger_branches`` sets out: a filter this fails to *see* reads as absent,
+    and absent passes. The floor is the event indent plus one rather than a
+    constant, which is the same rule the old ``\\s{3,}`` expressed when an event
+    could only sit at two.
+    """
+    return re.compile(
+        rf"^\s{{{indent + 1},}}[\"']?(" + "|".join(_FILTER_KEYS) + r")[\"']?\s*:\s*(.*)$"
+    )
 
 
 def _on_shorthand(value: str) -> dict[str, list[str] | None]:
@@ -519,7 +609,21 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     shape this still cannot see — YAML's explicit-key form, say — reads as
     absent and passes. That is the cost of ``None`` existing at all. It is
     bounded by the filter names being a closed, stable set, and it is why they
-    are matched by *name* at any indent rather than by position.
+    are matched by *name*, at any indent below the block's own, rather than by
+    position.
+
+    **That block indent is read rather than assumed.** Two spaces is what every
+    hand-written workflow uses and it was written into three patterns at once —
+    the event key, the commented-out event key, and the filter floor spelled
+    "three or more", which is the same constant one level down. A block written
+    four-per-level is ordinary YAML that GitHub runs, and it defeated all three
+    together: nothing matched as an event, so the guard either reported a
+    trigger the file plainly declares as absent, or refused that trigger's
+    filter as orphaned under a commented-out event key the file does not
+    contain. Two false messages, each sending the reader to fix a correct file.
+    ``_event_indent`` measures the block instead, and the filter floor follows
+    from it — which is also what stops the two recognisers overlapping now that
+    neither sits at a fixed depth.
 
     **The shapes ``on:`` itself takes are read, not skipped.** ``on: push`` and
     ``on: [push, pull_request]`` resolve to their events with no filter;
@@ -602,25 +706,30 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
         except ValueError as exc:
             raise ValueError(f"{workflow}: {exc}") from None
 
-    key_pattern = re.compile(
-        r"^\s{3,}[\"']?(" + "|".join(_FILTER_KEYS) + r")[\"']?\s*:\s*(.*)$"
-    )
+    block = _block(lines[start + 1:])
+    indent = _event_indent(block)
+    if indent is None:
+        # A block with no keys under it declares no events, and an empty result
+        # says exactly that. The assertion downstream then reports the event it
+        # wanted as missing, which is true.
+        return filters
+    event_key = _event_key(indent)
+    commented_event = _commented_event(indent)
+    key_pattern = _filter_key(indent)
 
     current: str | None = None
     # The event `current` held when a comment ended it. Kept rather than
     # discarded because whether its filter had already been read is what decides
     # if the keys below the comment are ambiguous or merely orphaned.
     suspended: str | None = None
-    for line in lines[start + 1:]:
-        if not line.strip():
-            continue
+    for line in block:
         if line.lstrip().startswith("#"):
             # Forgetting the current event is the whole of the fix: the keys
             # below a commented-out one belong to nothing, and attributing them
             # to the event above is worse than dropping them, because the event
             # above is real and its filter is then reported as something it is
             # not.
-            if _COMMENTED_EVENT.match(line):
+            if commented_event.match(line):
                 # Only the first of a run of these carries the live event.
                 # Overwriting on the second — a commented event whose own
                 # sub-keys are commented out under it, which is how a block is
@@ -630,9 +739,7 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
                     suspended = current
                 current = None
             continue
-        if not line.startswith(" "):
-            break
-        event = _EVENT_KEY.match(line)
+        event = event_key.match(line)
         if event:
             current = event.group(1)
             suspended = None
@@ -1290,6 +1397,104 @@ class TestGuardIsNotVacuous:
                 f"on:\n  pull_request:\n{filter_line}\njobs:\n", encoding="utf-8"
             )
             assert _trigger_branches(workflow) == {"pull_request": ["develop"]}, label
+
+    def test_an_on_block_is_read_at_whatever_indent_it_uses(self, tmp_path):
+        # Two spaces is a convention, not a rule, and assuming it put the same
+        # constant in three patterns at once. Four-per-level is ordinary YAML
+        # that GitHub runs; here its events matched nothing at all, and the two
+        # ways that came out were both false. Unfiltered, the block read as
+        # empty and the guard reported a workflow that "declares no
+        # `on.pull_request` trigger at all" — sending the reader to add a
+        # trigger the file already has. Filtered, the filter arrived with no
+        # event to attach to and was refused as orphaned under a commented-out
+        # event key that is nowhere in the file.
+        shapes = {
+            "four-per-level": (
+                "on:\n    pull_request:\n        branches: [develop]\njobs:\n",
+                {"pull_request": ["develop"]},
+            ),
+            "four-per-level, unfiltered": (
+                "on:\n    pull_request:\n    push:\njobs:\n",
+                {"pull_request": None, "push": None},
+            ),
+            # The filter floor follows the block rather than sitting at three,
+            # so a shallower block has to keep working too.
+            "one space": (
+                "on:\n pull_request:\n  branches: [develop]\njobs:\n",
+                {"pull_request": ["develop"]},
+            ),
+        }
+        for label, (text, expected) in shapes.items():
+            workflow = tmp_path / f"{label.replace(' ', '-').replace(',', '')}.yml"
+            workflow.write_text(text, encoding="utf-8")
+            assert _trigger_branches(workflow) == expected, label
+
+    def test_a_commented_out_event_is_read_at_the_blocks_own_indent(self, tmp_path):
+        # The comment rules follow the measured indent as well, in both
+        # directions. At the block's indent a commented event still ends the
+        # event above it, and one level in it still does not — the second half
+        # is what keeps a note about a filter from dropping that filter, which
+        # would read as unfiltered and pass.
+        workflow = tmp_path / "ends-it.yml"
+        workflow.write_text(
+            "on:\n"
+            "    pull_request:\n"
+            "        branches: [develop]\n"
+            "    # workflow_run:  # off for now\n"
+            "        branches: [main]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {"pull_request": ["develop"]}
+
+        workflow = tmp_path / "leaves-it.yml"
+        workflow.write_text(
+            "on:\n"
+            "    pull_request:\n"
+            "      # only the pivot\n"
+            "        branches: [main]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {"pull_request": ["main"]}
+
+    def test_an_orphan_does_not_fix_the_blocks_indent(self, tmp_path):
+        # Why the indent is the smallest one under the block and not the first.
+        # A commented-out event at the top of the block orphans its keys above
+        # the first live event, so the first key here sits at four — and taking
+        # it would put every real event, at two, below the block's own indent
+        # and out of sight. `push` would vanish, and `pull_request` with it.
+        #
+        # Refused, as this shape is refused at any other indent: the orphan is
+        # either the commented event's filter or nothing's, and nothing in the
+        # file says which.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  # pull_request:\n"
+            "    branches: [main]\n"
+            "  push:\n"
+            "    branches: [main]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="commented-out event key"):
+            _trigger_branches(workflow)
+
+    def test_a_note_flush_left_does_not_end_the_on_block(self, tmp_path):
+        # A comment ends the block nowhere, including at column zero. Ending it
+        # there would drop every line below the note — and a filter dropped that
+        # way reads as absent, which is the direction that passes.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request:\n"
+            "# restore the other trigger later\n"
+            "    branches: [develop]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {"pull_request": ["develop"]}
 
     def test_the_shorthand_forms_of_on_are_read(self, tmp_path):
         # Neither shorthand can carry a branch filter, so `None` here is proved
