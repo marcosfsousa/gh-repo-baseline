@@ -225,6 +225,67 @@ class TestJobContexts:
         with pytest.raises(SystemExit, match="sits at 3 spaces"):
             boot._job_contexts(workflow)
 
+    def test_a_sequence_shaped_jobs_block_exits(self, boot, tmp_path):
+        # `jobs:` maps ids to blocks. Written as a sequence it is not a jobs
+        # block at all, and the danger is not that the shape is exotic -- it is
+        # where the width gets seeded. The `- ` item is skipped by the key
+        # pattern, so the first line that does match is a key *inside* the item,
+        # one level too deep. That seeds the width, `steps` becomes a job, and
+        # the tool requires a context no job reports: pending forever, from the
+        # tool that exists to prevent it.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  - build:\n      steps:\n        - uses: ./a\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit, match=r"`jobs:` opens with"):
+            boot._job_contexts(workflow)
+
+    def test_a_sequence_shaped_jobs_block_exits_on_the_shape_not_the_value(
+        self, boot, tmp_path
+    ):
+        # The same shape carrying an inline value refused already, but by
+        # accident: `name` seeded the width, became a job id, and tripped the
+        # trailing-value check. Whether the old parser failed open or closed
+        # turned on whether the first key inside the item had a value, which is
+        # no kind of guarantee. Both spellings must stop on the sequence itself.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  - build:\n      name: The gate\n", encoding="utf-8"
+        )
+        with pytest.raises(SystemExit, match=r"`jobs:` opens with"):
+            boot._job_contexts(workflow)
+
+    def test_a_scalar_where_the_first_job_belongs_exits(self, boot, tmp_path):
+        # Same seed, different wrong shape. A block scalar opening the mapping is
+        # not a job id either, and skipping it leaves the width to be set by
+        # whatever follows.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text("jobs:\n  |\n  text\n", encoding="utf-8")
+        with pytest.raises(SystemExit, match=r"`jobs:` opens with"):
+            boot._job_contexts(workflow)
+
+    def test_a_job_id_may_not_open_with_a_hyphen(self, boot, tmp_path):
+        # GitHub requires the first character to be a letter or `_`. `-x:` clears
+        # the sequence-item lookahead, because that excludes `-` followed by a
+        # space and this one is followed by a letter, and the old charset
+        # permitted a leading hyphen -- so it was read as an ordinary job and its
+        # id written into a ruleset as a context GitHub would never report.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text("jobs:\n  -x:\n    name: A\n", encoding="utf-8")
+        with pytest.raises(SystemExit, match="is not a job id"):
+            boot._job_contexts(workflow)
+
+    def test_an_underscore_still_opens_a_job_id(self, boot, tmp_path):
+        # The other half of the rule above: tightening the first character must
+        # not cost the ids GitHub does allow.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  _build:\n    name: A\n  b-2_c:\n    runs-on: x\n",
+            encoding="utf-8",
+        )
+        assert boot._job_contexts(workflow) == ["A", "b-2_c"]
+
     def test_a_null_jobs_block_is_empty_rather_than_unreadable(self, boot, tmp_path):
         # `jobs: null` is a workflow with no jobs, and the tool must stop on it
         # -- deriving zero contexts writes a ruleset that requires nothing. What
@@ -506,6 +567,19 @@ class TestBothParserCopiesAgree:
         "                v: [1, 2]\n",
         "jobs:\n first:\n  name: A\n gate:\n  uses: ./.github/workflows/s.yml\n",
         "jobs:\n  first:\n    name: A\n   second:\n     name: B\n",
+        # The shapes that open the block with something that is not a job id.
+        # Both copies read the width off the first key-shaped line, so both
+        # seeded it off a key *inside* a sequence item and agreed on a job called
+        # `steps` -- agreeing, and both wrong, which is the one drift this class
+        # cannot see. Pinned here so a copy that loses the guard is caught by
+        # disagreeing with the copy that kept it.
+        "jobs:\n  - build:\n      steps:\n        - uses: ./a\n",
+        "jobs:\n  - build:\n      name: The gate\n",
+        # This one they genuinely disagreed on before: the tool stopped on the
+        # count and the guard returned nothing. Now both stop on the shape, which
+        # is the true reason and the same reason in both.
+        "jobs:\n  |\n  text\n",
+        "jobs:\n  -x:\n    name: A\n",
         # `jobs: ~` is deliberately absent. Neither copy refuses it as a flow
         # mapping any more, which is the fix, but they report the emptiness that
         # remains through different organs: the tool stops inside the parser, and
@@ -548,6 +622,9 @@ class TestBothParserCopiesAgree:
         "jobs:\n    build:\n        name: The gate\n",
         "jobs:\n build:\n  name: The gate\n",
         "jobs:\n  pytest:\n    strategy: null\n    name: The gate\n",
+        # Tightening the first character of a job id must cost neither copy an id
+        # GitHub allows, and must cost them the same ones.
+        "jobs:\n  _build:\n    name: A\n  b-2_c:\n    runs-on: x\n",
     ])
     def test_same_contexts_for_shapes_that_are_read_rather_than_refused(
         self, boot, template_guard, tmp_path, workflow_text

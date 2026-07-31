@@ -365,7 +365,8 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
         # but it is the same assumption in the same file and it costs nothing to
         # stop making it. The first key-shaped line inside the block is the first
         # job: comments and blanks are already skipped above, and a mapping
-        # cannot open with anything else.
+        # cannot open with anything else — which is asserted below rather than
+        # assumed, because reading the indent is what made it assailable.
         key = re.match(r"^( +)(?!-(?:\s|$))(\S[^:]*):(.*)$", line)
         if key and (jobs_indent is None or len(key.group(1)) == jobs_indent):
             jobs_indent = len(key.group(1))
@@ -379,16 +380,40 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
                     "This parser stops rather than attributing the keys below it "
                     "to the job above."
                 )
-            if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", job_id):
                 raise ValueError(
                     f"{workflow}: {job_id!r} is not a job id this parser can "
-                    "read.\nGitHub allows letters, digits, `-` and `_`. Anything "
-                    "else stops the parse rather than leaving the keys below it "
-                    "attributed to the job above."
+                    "read.\nGitHub allows letters, digits, `-` and `_`, and "
+                    "requires the first character to be a letter or `_`. "
+                    "Anything else stops the parse rather than leaving the keys "
+                    "below it attributed to the job above."
                 )
             current, body, strategy, in_strategy = job_id, None, None, False
             contexts[current] = current  # the id is the context until a name says otherwise
             continue
+        if jobs_indent is None:
+            # Nothing key-shaped has been seen yet, so this line sits where the
+            # first job id belongs and is not one. A mapping cannot open with a
+            # sequence item or a bare scalar, so this is not a `jobs:` block.
+            #
+            # Skipping it instead is a fail-open, and a subtle one: the line is
+            # passed over, `jobs_indent` stays unset, and the next key-shaped
+            # line seeds it — but that line is a key *inside* the item, one level
+            # too deep. `jobs:` / `- build:` / `steps:` collects a job called
+            # `steps` and requires a context no job reports, which leaves every
+            # pull request pending rather than red.
+            #
+            # It only became reachable when the sequence-item lookahead was added
+            # to the pattern above: before that a `- ` line matched as a key and
+            # was refused on its id. Reading the indent rather than fixing it is
+            # what makes the seed worth guarding — a fixed column refused this by
+            # collecting nothing, loudly.
+            raise ValueError(
+                f"{workflow}: `jobs:` opens with {line.strip()!r}, which is not "
+                "a job id.\nA job id maps to a block; this is a sequence item or "
+                "a scalar. This parser stops rather than reading the keys inside "
+                "it as jobs."
+            )
         if current is None:
             continue
         key = _key(line)
