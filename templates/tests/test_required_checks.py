@@ -57,7 +57,7 @@ whatever manifest CI installs — and if CI installs the deploy manifest unchang
 (it should), that means a dependency in the serving image for the benefit of one
 test. The job header is a fixed, shallow shape.
 
-Two details the shape depends on:
+Three details the shape depends on:
 
 **A job's check context is its ``name:``, or its job id when it has none.** The
 parser falls back the same way GitHub does, so a job that loses its ``name:``
@@ -65,6 +65,15 @@ fails here as a rename rather than vanishing from the comparison.
 
 **``#`` opens a comment only at line start or after whitespace**, per YAML, so a
 value is truncated on that pattern and not on every ``#``.
+
+**A context GitHub composes is refused, not guessed.** A matrix job reports one
+suffixed check per combination and a reusable-workflow job reports
+``caller / called``; neither is derivable from this file, and both would produce
+a required context nothing reports. ``_job_contexts`` stops on them, which turns
+the pending-forever failure into a red suite — the same trade ``_scalar`` makes
+for a block scalar. The cost is that a repo whose gate is a matrix cannot use
+this guard unmodified, which is the right way round: it fails at the point the
+assumption breaks rather than the day someone opens a pull request.
 
 The same parser exists in ``scripts/bootstrap-repo.py`` in the baseline repo,
 which uses it for ``--checks-from``. The duplication is deliberate: this file
@@ -188,6 +197,31 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
     Job ids sit at two spaces under ``jobs:`` and a job-level ``name:`` at four.
     Step names are ``- name:`` at six and are therefore excluded structurally,
     not by pattern — see ``test_step_names_are_not_collected``.
+
+    **A job key is recognised by its shape before its id is read**, so a key this
+    cannot vouch for stops the parse instead of being skipped. Skipping was two
+    silent wrongs from one comment: ``pytest:  # the gate`` failed the
+    end-of-line anchor, so the job vanished from the equality *and* the ``name:``
+    beneath it was recorded against the job above — reporting a rename on a job
+    nobody touched.
+
+    **A job whose context GitHub composes is refused**, for the same reason
+    ``_scalar`` refuses a block scalar: it cannot be derived from this file, and
+    deriving the wrong one is precisely the silent failure this guard exists to
+    prevent. Two shapes compose:
+
+    ``strategy.matrix``
+        One check per combination, suffixed — ``pytest (3.11)``, not ``pytest``.
+        The values may come from ``fromJSON`` and need not appear in the file at
+        all, so there is no shape to read even in principle.
+
+    ``uses:`` (a reusable workflow)
+        The context is ``caller / called``, and the called job's name lives in
+        the other file.
+
+    Both are refused rather than guessed at because both fail the same way when
+    guessed wrong: a required context nothing reports, and a pull request that
+    sits pending rather than red.
     """
     contexts: dict[str, str] = {}
     lines = workflow.read_text(encoding="utf-8").splitlines()
@@ -197,18 +231,71 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
     except StopIteration:  # pragma: no cover - asserted directly below
         return contexts
 
+    def _refuse(job: str, what: str, fix: str) -> None:
+        raise ValueError(
+            f"{workflow}, job {job!r}: {what}, so the check it reports is not "
+            f"the job id or its `name:`.\nThis parser will not guess at a "
+            f"composed context. {fix}"
+        )
+
     current: str | None = None
+    strategy_of: str | None = None  # the job whose `strategy:` we are inside
     for line in lines[start + 1:]:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         # A non-indented key ends the jobs block.
         if not line.startswith(" "):
             break
-        job = re.match(r"^  ([A-Za-z0-9_-]+):\s*$", line)
-        if job:
-            current = job.group(1)
+        # Matched on the key *shape* — two spaces, then anything up to a colon —
+        # rather than on the id charset, so an id this cannot read is refused
+        # below instead of falling through to the `name:` branch with `current`
+        # still naming the previous job.
+        key = re.match(r"^  (\S[^:]*):(.*)$", line)
+        if key:
+            job_id, trailing = key.group(1), _strip_comment(key.group(2))
+            if trailing:
+                # A job id maps to a block, so anything left after the comment is
+                # stripped is not a job at all.
+                raise ValueError(
+                    f"{workflow}: `{job_id}:` sits where a job id belongs but "
+                    f"carries the value {trailing!r}.\nA job maps to a block. "
+                    "This parser stops rather than attributing the keys below it "
+                    "to the job above."
+                )
+            if not re.fullmatch(r"[A-Za-z0-9_-]+", job_id):
+                raise ValueError(
+                    f"{workflow}: {job_id!r} is not a job id this parser can "
+                    "read.\nGitHub allows letters, digits, `-` and `_`. Anything "
+                    "else stops the parse rather than leaving the keys below it "
+                    "attributed to the job above."
+                )
+            current = job_id
+            strategy_of = None
             contexts[current] = current  # the id is the context until a name says otherwise
             continue
+        if current is None:
+            continue
+        # `uses:` at four spaces is a reusable-workflow call; a step's is `- uses:`
+        # at six and does not match.
+        if re.match(r"^    uses\s*:", line):
+            _refuse(
+                current,
+                "calls a reusable workflow, so GitHub reports it as "
+                "`caller / called`",
+                "Require that context explicitly, or inline the job.",
+            )
+        if re.match(r"^    strategy\s*:", line):
+            strategy_of = current
+            continue
+        if re.match(r"^    \S", line):
+            strategy_of = None  # a sibling key ended the strategy block
+        if strategy_of == current and re.match(r"^      matrix\s*:", line):
+            _refuse(
+                current,
+                "is a matrix job, so GitHub reports one suffixed check per "
+                f"combination (`{current} (3.11)`) and none named `{current}`",
+                "Require each combination explicitly, or drop the matrix.",
+            )
         name = re.match(r"^    name:\s*(.+)$", line)
         if name and current:
             # A refusal propagates and fails the suite, naming the job. That is
@@ -452,9 +539,16 @@ class TestEveryRequiredCheckExists:
             + f"\n\nJobs currently report: {sorted(contexts)}\n\n"
             "A required check that never arrives leaves the pull request "
             "pending, not red — the rule reads as protection while applying to "
-            "nothing. If a job was renamed, rename the context in the ruleset "
-            "to match and re-apply it; the committed file is not what GitHub "
-            "enforces until it is written through the API."
+            "nothing.\n\n"
+            f"This reads {_WORKFLOW.name} and nothing else, so there are two "
+            "ways to get here. If the context names a job that used to be in "
+            "that file, it was renamed: rename the context in the ruleset to "
+            "match and re-apply it — the committed file is not what GitHub "
+            "enforces until it is written through the API. If it names a job in "
+            "another workflow, nothing is renamed and the ruleset may be right; "
+            f"point _WORKFLOW at that file, or require only checks {_WORKFLOW.name} "
+            "reports. Requiring a check from a workflow this does not read means "
+            "no test can tell you when that one is renamed."
         )
 
 
@@ -712,6 +806,94 @@ class TestGuardIsNotVacuous:
             # No `name:`, so GitHub reports the job id — and so does this.
             "unnamed": "unnamed",
         }
+
+    def test_a_job_key_with_a_trailing_comment_is_still_a_job(self, tmp_path):
+        # The end-of-line anchor this used to carry dropped the job from the
+        # equality and left `current` naming the job above, so the `name:` below
+        # was recorded against *that* job — a rename reported on a job nobody
+        # touched, from one comment on one line.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  first:\n"
+            "    name: The first job\n"
+            "  gate:  # the one that blocks a merge\n"
+            "    name: The gate\n",
+            encoding="utf-8",
+        )
+        assert _job_contexts(workflow) == {
+            "first": "The first job",
+            "gate": "The gate",
+        }
+
+    def test_a_job_key_this_parser_cannot_read_stops_it(self, tmp_path):
+        # Fails closed rather than skipping. A skipped key leaves `current`
+        # pointed at the previous job, so the next `name:` silently overwrites a
+        # context that was correct — worse than not parsing at all.
+        for key in ('  "quoted id":', "  has spaces:", "  value: here"):
+            workflow = tmp_path / "w.yml"
+            workflow.write_text(
+                f"jobs:\n  first:\n    name: The first job\n{key}\n"
+                "    name: Not the first job\n",
+                encoding="utf-8",
+            )
+            with pytest.raises(ValueError):
+                _job_contexts(workflow)
+
+    def test_a_matrix_job_is_refused(self, tmp_path):
+        # GitHub reports `pytest (3.11)`, never `pytest`. Deriving `pytest` gives
+        # a required context nothing reports, which leaves the pull request
+        # pending rather than red — silent, and the reason this stops instead.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  pytest:\n"
+            "    strategy:\n"
+            "      matrix:\n"
+            "        python-version: ['3.11', '3.12']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="matrix job"):
+            _job_contexts(workflow)
+
+    def test_a_strategy_without_a_matrix_is_not_refused(self, tmp_path):
+        # `fail-fast` on its own does not compose the context, so refusing here
+        # would fail a correct workflow — the direction that gets a guard deleted.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  pytest:\n"
+            "    strategy:\n"
+            "      fail-fast: false\n"
+            "    name: The gate\n",
+            encoding="utf-8",
+        )
+        assert _job_contexts(workflow) == {"pytest": "The gate"}
+
+    def test_a_reusable_workflow_job_is_refused(self, tmp_path):
+        # The context is `caller / called` and the called name is in the other
+        # file, so there is nothing here to read even in principle.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  build:\n    uses: ./.github/workflows/shared.yml\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="reusable workflow"):
+            _job_contexts(workflow)
+
+    def test_a_step_that_uses_an_action_is_not_a_reusable_workflow(self, tmp_path):
+        # `- uses:` at six spaces is a step. Matching it would refuse nearly every
+        # real workflow, so the distinction is structural and asserted directly.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  build:\n"
+            "    name: The gate\n"
+            "    steps:\n"
+            "      - uses: actions/checkout@v4\n",
+            encoding="utf-8",
+        )
+        assert _job_contexts(workflow) == {"build": "The gate"}
 
     def test_a_hash_inside_quotes_is_not_a_comment(self):
         # `#` opens a comment only outside quotes. Truncating here would derive

@@ -6,7 +6,7 @@
 That file is a guard, and a guard that cannot go red is not a guard. Asserting it
 passes on a correct repo proves almost nothing — a file containing no assertions
 at all would do the same. So this suite assembles a throwaway repo out of
-``templates/``, checks the guard passes, and then breaks the repo fifteen
+``templates/``, checks the guard passes, and then breaks the repo sixteen
 different ways and checks the guard fails **on exactly the intended tests and no
 others**.
 
@@ -162,6 +162,13 @@ def _edit_checks_params(root, key: str, value) -> None:
     _write_ruleset(root, data)
 
 
+def _require_context(root, context: str) -> None:
+    data = _read_ruleset(root)
+    rule = next(r for r in data["rules"] if r["type"] == "required_status_checks")
+    rule["parameters"]["required_status_checks"].append({"context": context})
+    _write_ruleset(root, data)
+
+
 # ── The guard on a correct repo ───────────────────────────────────────────────
 
 class TestTheGuardPasses:
@@ -180,7 +187,7 @@ class TestTheGuardPasses:
              "-q", "--no-header", "--collect-only", "-p", "no:cacheprovider"],
             capture_output=True, text=True,
         )
-        assert "30 tests collected" in result.stdout, result.stdout[-600:]
+        assert "36 tests collected" in result.stdout, result.stdout[-600:]
 
     def test_the_readme_states_the_right_number_of_mutations(self):
         # README.md quotes this count in prose. The stale `# 48 tests` it used to
@@ -202,7 +209,7 @@ class TestTheGuardPasses:
         )
 
 
-# ── The guard on fifteen broken repos ────────────────────────────────────────
+# ── The guard on sixteen broken repos ────────────────────────────────────────
 #
 # Each entry is (label, mutation, the exact set of tests that must fail).
 
@@ -284,6 +291,19 @@ MUTATIONS = [
         # assertion catches downstream. Kept end-to-end rather than left to the
         # unit test because that default is reached through the guard's own
         # assertion, not through the parser's return value alone.
+    ),
+    pytest.param(
+        lambda root: _require_context(root, "security / codeql"),
+        {"test_every_required_context_is_a_job"},
+        id="a-check-from-another-workflow-is-required",
+        # Not a rename, and the ruleset may well be right — the guard reads one
+        # workflow and that context comes from another. It fires here either way,
+        # which is correct: a required check from a file nothing parses is a
+        # check no test can tell you was renamed. What it must not do is say the
+        # job was renamed, which is what its message used to claim.
+        #
+        # `test_every_job_is_a_required_context` deliberately does not fire: every
+        # job is still required. Only the unmatched direction breaks.
     ),
     pytest.param(
         lambda root: _drop_rule(root, "non_fast_forward"),
