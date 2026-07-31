@@ -185,7 +185,7 @@ def _require_context(root, context: str) -> None:
 #
 # Bump it when the template gains or loses a test. That is a line in a diff,
 # which is the point: the count is a decision, not an incidental.
-_TEMPLATE_GUARD_TESTS = 47
+_TEMPLATE_GUARD_TESTS = 51
 
 
 class TestTheGuardPasses:
