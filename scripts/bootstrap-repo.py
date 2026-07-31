@@ -178,6 +178,40 @@ def _strip_comment(value: str) -> str:
     return re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip()
 
 
+def _key(line: str) -> tuple[int, str, str] | None:
+    """
+    ``(indent, key, raw value)`` for a line that is a mapping key, else ``None``.
+
+    One reader for every key below a job, so the caller can place a key by
+    comparing its indent to the job's rather than to a constant. Each key having
+    its own regex pinned to its own column is what let a ``strategy:`` at six
+    spaces, or a quoted ``"matrix":``, pass unseen -- and unseen reads as absent,
+    which is the fail-open direction.
+
+    Tolerant about the shapes YAML allows for the key itself: quoted either way,
+    and a space before the colon. That tolerance is safe here in a way it would
+    not be for a job id, and the asymmetry is deliberate. These key names are
+    only a structural signal -- over-recognising one costs a refusal, which is
+    loud. A job id *is* the context string, so a quoting form this cannot fully
+    decode is refused instead.
+
+    The value is returned **raw**. ``_scalar`` reads quoting before comments, and
+    stripping the comment out of ``name: 'Build #1'`` here would defeat it;
+    callers wanting a plain value strip it themselves.
+
+    A list item is not a key: ``- uses: actions/checkout@v4`` is a step, and
+    reading it as a job's ``uses:`` would refuse nearly every real workflow.
+    """
+    match = re.match(
+        r"^( *)(?!-(?:\s|$))(?:\"([^\"]*)\"|'([^']*)'|([^\s:#][^:]*?))\s*:(?:\s(.*)|)$",
+        line,
+    )
+    if not match:
+        return None
+    indent, double, single, plain, value = match.groups()
+    return len(indent), double or single or plain or "", value or ""
+
+
 def _scalar(value: str) -> str | None:
     """
     What a job's ``name:`` denotes, or ``None`` when it denotes nothing and the
@@ -265,8 +299,13 @@ def _job_contexts(workflow: Path) -> list[str]:
     manifest the target repo's CI installs, for the benefit of one test. The job
     header is a fixed, shallow shape.
 
-    Step names are ``- name:`` at six spaces and are therefore excluded
-    structurally rather than by pattern.
+    Job ids sit at two spaces under ``jobs:``; everything below one is placed by
+    comparing indents, because the first key under a job fixes the level that
+    job's own keys sit at. Matching each key at a fixed column instead failed
+    *open*: four-space-per-level indentation is ordinary YAML, it matched
+    nothing, and nothing matched reads as absent -- so a matrix job reached no
+    refusal and a ``name:`` reached no context. Step names are list items and are
+    therefore excluded structurally rather than by pattern.
 
     A job key is recognised by its shape before its id is read, so a key this
     cannot vouch for stops the run instead of being skipped -- skipping left the
@@ -274,7 +313,9 @@ def _job_contexts(workflow: Path) -> list[str]:
     above. A job whose context GitHub composes (``strategy.matrix``, or ``uses:``
     for a reusable workflow) is refused for the same reason ``_scalar`` refuses a
     block scalar: requiring a context nothing reports leaves a pull request
-    pending rather than red. Pass those with ``--check`` instead.
+    pending rather than red. Pass those with ``--check`` instead. A ``strategy:``
+    written inline is refused on its value alone -- the matrix inside a flow
+    mapping is just as real and there is no ``matrix:`` line to find.
 
     The copy in ``templates/tests/test_required_checks.py`` returns
     ``{job id: context}`` where this returns just the contexts — it needs the id
@@ -285,9 +326,22 @@ def _job_contexts(workflow: Path) -> list[str]:
     contexts: dict[str, str] = {}
     lines = workflow.read_text(encoding="utf-8").splitlines()
 
-    try:
-        start = next(i for i, line in enumerate(lines) if line.rstrip() == "jobs:")
-    except StopIteration:
+    # Found by shape, not by an exact line: `jobs:  # all of them` is still the
+    # jobs block, and reading it as absent means parsing no jobs at all.
+    start = None
+    for index, line in enumerate(lines):
+        key = _key(line)
+        if key and key[0] == 0 and key[1] == "jobs":
+            inline = _strip_comment(key[2])
+            if inline:
+                sys.exit(
+                    f"{workflow}: `jobs:` carries the value {inline!r}.\n"
+                    "The jobs block is read by indentation, so a flow mapping is "
+                    "refused rather than half-read."
+                )
+            start = index
+            break
+    if start is None:
         sys.exit(f"{workflow} has no top-level `jobs:` block.")
 
     def _refuse(job: str, what: str, fix: str) -> None:
@@ -298,7 +352,9 @@ def _job_contexts(workflow: Path) -> list[str]:
         )
 
     current: str | None = None
-    strategy_of: str | None = None  # the job whose `strategy:` we are inside
+    body: int | None = None      # the indent `current`'s own keys sit at
+    strategy: int | None = None  # the indent the keys inside its `strategy:` sit at
+    in_strategy = False
     for line in lines[start + 1:]:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
@@ -326,37 +382,67 @@ def _job_contexts(workflow: Path) -> list[str]:
                     "else stops the parse rather than leaving the keys below it "
                     "attributed to the job above."
                 )
-            current = job_id
-            strategy_of = None
+            current, body, strategy, in_strategy = job_id, None, None, False
             contexts[current] = current  # the id is the context until a name says otherwise
             continue
         if current is None:
             continue
-        # `uses:` at four spaces is a reusable-workflow call; a step's is `- uses:`
-        # at six and does not match.
-        if re.match(r"^    uses\s*:", line):
+        key = _key(line)
+        if key is None:
+            # A step's `- uses:`, a block scalar's contents, a bare list item.
+            # None of them is a key of this job.
+            continue
+        indent, name, value = key
+        if body is None:
+            # The first key under the job fixes the level its own keys sit at.
+            # Read rather than assumed, because assuming four was the fail-open.
+            body = indent
+        if indent > body:
+            # Nested: inside a step, a `with:`, or a `strategy:`.
+            if in_strategy:
+                if strategy is None:
+                    strategy = indent
+                if indent == strategy and name == "matrix":
+                    _refuse(
+                        current,
+                        "is a matrix job, so GitHub reports one suffixed check "
+                        f"per combination (`{current} (3.11)`) and none named "
+                        f"`{current}`",
+                        "Pass each combination with --check, or drop the matrix.",
+                    )
+            continue
+        if indent < body:
+            sys.exit(
+                f"{workflow}, job {current!r}: `{line.strip()}` sits at {indent} "
+                f"spaces where this job's other keys sit at {body}.\n"
+                "Keys are placed by comparing indents, so a job written at two "
+                "levels at once stops the parse rather than having half of it "
+                "read -- the half that goes missing would be read as absent."
+            )
+        # A key of the job itself, so any `strategy:` block has ended.
+        in_strategy, strategy = False, None
+        if name == "uses":
             _refuse(
                 current,
                 "calls a reusable workflow, so GitHub reports it as "
                 "`caller / called`",
                 "Pass that context with --check, or inline the job.",
             )
-        if re.match(r"^    strategy\s*:", line):
-            strategy_of = current
+        if name == "strategy":
+            inline = _strip_comment(value)
+            if inline:
+                sys.exit(
+                    f"{workflow}, job {current!r}: `strategy:` carries the inline "
+                    f"value {inline!r}.\nA `matrix:` written inside it composes "
+                    "the context just as a block one does, and this parser reads "
+                    "neither out of a flow mapping. Write the strategy as a "
+                    "block, or pass each combination with --check."
+                )
+            in_strategy = True
             continue
-        if re.match(r"^    \S", line):
-            strategy_of = None  # a sibling key ended the strategy block
-        if strategy_of == current and re.match(r"^      matrix\s*:", line):
-            _refuse(
-                current,
-                "is a matrix job, so GitHub reports one suffixed check per "
-                f"combination (`{current} (3.11)`) and none named `{current}`",
-                "Pass each combination with --check, or drop the matrix.",
-            )
-        name = re.match(r"^    name:\s*(.+)$", line)
-        if name and current:
+        if name == "name":
             try:
-                scalar = _scalar(name.group(1))
+                scalar = _scalar(value)
             except ValueError as exc:
                 sys.exit(f"{workflow}, job {current!r}: {exc}")
             # None means the name denotes nothing, so the job id already recorded

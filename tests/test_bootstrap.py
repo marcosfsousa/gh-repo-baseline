@@ -151,6 +151,103 @@ class TestJobContexts:
         )
         assert boot._job_contexts(workflow) == ["The gate"]
 
+    def test_a_matrix_is_refused_wherever_the_job_puts_it(self, boot, tmp_path):
+        # The refusal keyed on `strategy:` at exactly four spaces and `matrix:`
+        # at exactly six, unquoted. Everything below is ordinary YAML that
+        # GitHub runs, and every one of them derived the bare context `pytest`
+        # -- which a matrix job never reports, so the rule would wait forever.
+        shapes = {
+            "four-per-level": (
+                "jobs:\n"
+                "  pytest:\n"
+                "      strategy:\n"
+                "          matrix:\n"
+                "            python-version: ['3.11', '3.12']\n"
+            ),
+            "quoted keys": (
+                "jobs:\n"
+                "  pytest:\n"
+                '    "strategy":\n'
+                "      'matrix':\n"
+                "        python-version: ['3.11']\n"
+            ),
+            "space before the colon": (
+                "jobs:\n  pytest:\n    strategy :\n      matrix :\n        v: [1]\n"
+            ),
+        }
+        for label, text in shapes.items():
+            workflow = tmp_path / f"{label.replace(' ', '-')}.yml"
+            workflow.write_text(text, encoding="utf-8")
+            with pytest.raises(SystemExit, match="is a matrix job"):
+                boot._job_contexts(workflow)
+
+    def test_a_strategy_written_inline_exits(self, boot, tmp_path):
+        # A real matrix with no `matrix:` line to find. Reading the flow mapping
+        # needs a parser this deliberately is not, so the value alone stops it.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  pytest:\n"
+            "    strategy: {matrix: {python-version: ['3.11', '3.12']}}\n"
+            "    name: The gate\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit, match="inline value"):
+            boot._job_contexts(workflow)
+
+    def test_a_step_key_called_matrix_is_not_a_matrix_job(self, boot, tmp_path):
+        # The bound on recognising `matrix:` more loosely. Outside a `strategy:`
+        # the name composes nothing, and exiting here would refuse a correct
+        # workflow -- worse than the bug, because it stops the tool entirely.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  build:\n"
+            "    name: The gate\n"
+            "    steps:\n"
+            "      - uses: ./.github/actions/setup\n"
+            "        with:\n"
+            "          matrix: not-a-strategy\n",
+            encoding="utf-8",
+        )
+        assert boot._job_contexts(workflow) == ["The gate"]
+
+    def test_a_name_is_read_wherever_the_job_puts_it(self, boot, tmp_path):
+        # The same defect one key over and quieter: an unseen `name:` left the
+        # job id standing, which is a plausible answer rather than an obviously
+        # wrong one, so nothing downstream could tell it was never read.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  gate:\n      name: The gate\n      runs-on: ubuntu-latest\n",
+            encoding="utf-8",
+        )
+        assert boot._job_contexts(workflow) == ["The gate"]
+
+    def test_a_job_written_at_two_indents_exits(self, boot, tmp_path):
+        # What comparing indents can get wrong, and the one shape that makes it
+        # ambiguous. Not a workflow GitHub would run either.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n  gate:\n      name: The gate\n    runs-on: ubuntu-latest\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(SystemExit, match="two levels at once"):
+            boot._job_contexts(workflow)
+
+    def test_the_jobs_block_is_found_by_shape(self, boot, tmp_path):
+        # `jobs:  # all of them` failed an exact-line comparison, and a jobs
+        # block that is not found exits as a workflow with no jobs at all.
+        for header in ("jobs:  # all of them", '"jobs":', "jobs :"):
+            workflow = tmp_path / "w.yml"
+            workflow.write_text(
+                f"{header}\n  build:\n    name: The gate\n", encoding="utf-8"
+            )
+            assert boot._job_contexts(workflow) == ["The gate"], header
+        workflow = tmp_path / "inline.yml"
+        workflow.write_text("jobs: {build: {name: The gate}}\n", encoding="utf-8")
+        with pytest.raises(SystemExit, match="flow mapping"):
+            boot._job_contexts(workflow)
+
     def test_a_reusable_workflow_job_exits(self, boot, tmp_path):
         workflow = tmp_path / "w.yml"
         workflow.write_text(
@@ -297,6 +394,19 @@ class TestBothParserCopiesAgree:
         "jobs:\n  build:\n    name: B\n    steps:\n      - uses: actions/checkout@v4\n",
         'jobs:\n  first:\n    name: A\n  "quoted id":\n    name: B\n',
         "jobs:\n  first:\n    name: A\n  value: here\n    name: B\n",
+        # The shapes the recogniser used to miss. Each one is a place the two
+        # copies could now disagree about *whether* to stop, which is worse than
+        # either answer: the tool would write a ruleset the guard then refuses to
+        # check, or the guard would refuse a workflow the tool happily requires.
+        "jobs:\n  pytest:\n      strategy:\n          matrix:\n            v: [1]\n",
+        'jobs:\n  pytest:\n    "strategy":\n      \'matrix\':\n        v: [1]\n',
+        "jobs:\n  pytest:\n    strategy :\n      matrix :\n        v: [1]\n",
+        "jobs:\n  pytest:\n    strategy: {matrix: {v: [1, 2]}}\n    name: The gate\n",
+        "jobs:\n  gate:\n      name: The gate\n    runs-on: ubuntu-latest\n",
+        "jobs:  # all of them\n  build:\n    name: The gate\n",
+        "jobs: {build: {name: The gate}}\n",
+        "jobs:\n  build:\n    name: B\n    steps:\n      - uses: ./a\n"
+        "        with:\n          matrix: not-a-strategy\n",
     ])
     def test_same_refusals_for_composed_and_unreadable_job_keys(
         self, boot, template_guard, tmp_path, workflow_text
@@ -319,6 +429,41 @@ class TestBothParserCopiesAgree:
         assert refused(lambda: template_guard._job_contexts(workflow)) == refused(
             lambda: boot._job_contexts(workflow)
         ), workflow_text
+
+    @pytest.mark.parametrize("workflow_text", [
+        "jobs:\n  gate:\n      name: The gate\n      runs-on: ubuntu-latest\n",
+        "jobs:  # all of them\n  build:\n    name: The gate\n",
+        '"jobs":\n  build:\n    name: The gate\n',
+        "jobs:\n  build:\n    name: The gate\n    steps:\n      - uses: ./a\n"
+        "        with:\n          matrix: not-a-strategy\n",
+        "jobs:\n  pytest:\n      strategy:\n          fail-fast: false\n"
+        "      name: The gate\n",
+    ])
+    def test_same_contexts_for_shapes_that_are_read_rather_than_refused(
+        self, boot, template_guard, tmp_path, workflow_text
+    ):
+        # The refusal comparison above passes when both copies agree not to stop,
+        # which on these shapes is most of the answer but not the interesting
+        # part. What each copy then *derives* has to match too -- a `name:` seen
+        # by one and missed by the other is the exact drift that leaves the tool
+        # requiring a context the guard says no job reports.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(workflow_text, encoding="utf-8")
+        assert list(template_guard._job_contexts(workflow).values()) == (
+            boot._job_contexts(workflow)
+        ), workflow_text
+
+    @pytest.mark.parametrize("line", [
+        "  build:", "    name: The gate", "      strategy:", '    "strategy":',
+        "    'matrix' :", "      - uses: actions/checkout@v4", "  # a comment",
+        "jobs:  # all of them", "    name: 'Build #1'  # quoted", "        echo hi",
+        "    if: ${{ github.event_name == 'push' }}", "    run: |", "-", "",
+        "    strategy: {matrix: {v: [1]}}", "  a:b: c", '  "a:b": c',
+    ])
+    def test_same_key_reading(self, boot, template_guard, line):
+        # Every placement decision below a job now runs through `_key`, so the
+        # two copies agreeing here is what makes them agree about indents at all.
+        assert template_guard._key(line) == boot._key(line), line
 
     def test_same_comment_stripping(self, boot, template_guard):
         # `#` opens a comment at line start or after whitespace only, per YAML, so
