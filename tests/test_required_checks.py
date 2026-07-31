@@ -555,6 +555,16 @@ _ON_KEY = re.compile(r"^[\"']?on[\"']?\s*:\s*(.*)$")
 # sits at the block's indent and a filter key below it, whatever that indent
 # turns out to be.
 
+# A block sequence item: a dash followed by whitespace or nothing. The space is
+# the whole of what makes it a sequence — `-pull_request` is the plain scalar
+# "-pull_request", not an item holding `pull_request`, and reading it as one
+# turned a workflow GitHub never runs into a recognised trigger that passes.
+# The indent is captured so the caller can require one consistent depth: a
+# deeper `- ` does not open a nested sequence here, it continues the plain
+# scalar above it.
+_SEQUENCE_ITEM = re.compile(r"^( *)-(?:\s+(.*)|\s*)$")
+
+
 def _block(lines: list[str]) -> list[str]:
     """
     The lines of an indented block, from just below its key to the next
@@ -566,6 +576,13 @@ def _block(lines: list[str]) -> list[str]:
     dropped that way reads as absent — which is the direction that passes, on a
     workflow whose only fault is a note written flush left.
 
+    **Nor does a sequence item at column zero**, which is not the edge case it
+    looks like: YAML lets a block sequence sit at its key's own indent, and that
+    is the spelling every serialiser emits. Treated as the next top-level key it
+    ended the block immediately, leaving nothing to read and the guard reporting
+    a workflow that declares no trigger — on the most ordinary way there is to
+    write one.
+
     One reader for both passes below, so the pass that measures the block's
     indent and the pass that classifies its keys cannot disagree about where the
     block stops.
@@ -574,7 +591,11 @@ def _block(lines: list[str]) -> list[str]:
     for line in lines:
         if not line.strip():
             continue
-        if not line.startswith(" ") and not line.lstrip().startswith("#"):
+        if (
+            not line.startswith(" ")
+            and not line.lstrip().startswith("#")
+            and not _SEQUENCE_ITEM.match(line)
+        ):
             break
         block.append(line)
     return block
@@ -710,20 +731,39 @@ def _on_block(block: list[str]) -> dict[str, list[str] | None]:
     ``on:`` with an empty block declares no events, and reporting the wanted one
     as missing is then accurate.
 
+    A single line is handed to ``_on_shorthand`` rather than read here, because
+    it is the same question one indent over: ``on:`` / ``[push, pull_request]``
+    is the flow sequence that function already reads, and ``on:`` / ``{…}`` is
+    the flow mapping it already refuses for being able to carry a filter. One
+    reader for both spellings, so they cannot come to differ.
+
     Anything else is refused rather than read as empty. Two plain scalars on
     consecutive lines are one folded scalar and not two events; a block mixing
-    sequence items with something else is not YAML this should guess at. Refusing
-    is the loud direction, and the shape is rare enough to cost nothing.
+    sequence items with something else is not YAML this should guess at.
+    Refusing is the loud direction, and the shape is rare enough to cost nothing.
+
+    **The item shape is read strictly**, which is the one place leniency here
+    would be the fail-open direction rather than a kindness. A dash binds as a
+    sequence indicator only when whitespace follows it, so ``-pull_request`` is
+    the plain scalar ``"-pull_request"`` — an event GitHub does not have, on a
+    workflow it will not run. And items must share one indent: a deeper ``- ``
+    continues the plain scalar above it instead of nesting, so ``- push`` with
+    ``- pull_request`` below it at four spaces is the single scalar
+    ``"push - pull_request"``. Read loosely, both resolved to real event names
+    with no filter, which passes — a workflow whose checks never report,
+    vouched for by the guard that exists to catch exactly that.
     """
     content = [line for line in block if not line.lstrip().startswith("#")]
     if not content:
         return {}
 
-    items = [re.match(r"^\s+-\s*(.*)$", line) for line in content]
+    items = [_SEQUENCE_ITEM.match(line) for line in content]
     if all(items):
-        names = [_strip_comment(item.group(1)).strip("'\"") for item in items]
+        names = [_strip_comment(item.group(2) or "").strip("'\"") for item in items]
+        if len({len(item.group(1)) for item in items}) > 1:
+            names = []  # one folded scalar, not a sequence
     elif len(content) == 1:
-        names = [_strip_comment(content[0]).strip("'\"")]
+        return _on_shorthand(_strip_comment(content[0]))
     else:
         names = []
 
@@ -1801,7 +1841,16 @@ class TestGuardIsNotVacuous:
         shapes = {
             "on:\n  - push\n  - pull_request\njobs:\n":
                 {"push": None, "pull_request": None},
+            # At the key's own indent, which is what every YAML serialiser
+            # emits and the spelling most likely to be met in the wild. Read as
+            # a top-level key it ended the block on its first line.
+            "on:\n- push\n- pull_request\njobs:\n":
+                {"push": None, "pull_request": None},
             "on:\n  pull_request\njobs:\n": {"pull_request": None},
+            # The flow sequence one indent over from where `_on_shorthand`
+            # reads it. Same shape, same answer, or the two spellings differ.
+            "on:\n  [push, pull_request]\njobs:\n":
+                {"push": None, "pull_request": None},
             "on:\n  - pull_request  # only this one for now\njobs:\n":
                 {"pull_request": None},
             "on:\n  # - push\n  - pull_request\njobs:\n": {"pull_request": None},
@@ -1826,10 +1875,20 @@ class TestGuardIsNotVacuous:
         # events, and a sequence item mixed with something else is not a shape
         # to guess at. Refused rather than read as empty: empty reads as a
         # missing trigger, and the file may well declare the one it is asked for.
+        #
+        # The last two are the fail-open direction rather than the noisy one,
+        # and are why the item shape is matched strictly. A dash is a sequence
+        # indicator only when whitespace follows, so `-pull_request` is the
+        # scalar `"-pull_request"`; and a deeper `- ` continues the scalar above
+        # it rather than nesting, so those two lines are `"push - pull_request"`.
+        # Read loosely, both yielded real event names carrying no filter, which
+        # passes — on workflows GitHub will not run at all.
         for text in (
             "on:\n  push\n  pull_request\njobs:\n",
             "on:\n  - push\n  pull_request\njobs:\n",
             "on:\n  - {pull_request: {branches: [develop]}}\njobs:\n",
+            "on:\n  -pull_request\njobs:\n",
+            "on:\n  - push\n    - pull_request\njobs:\n",
         ):
             workflow = tmp_path / "w.yml"
             workflow.write_text(text, encoding="utf-8")
