@@ -171,6 +171,23 @@ def _require_context(root, context: str) -> None:
 
 # ── The guard on a correct repo ───────────────────────────────────────────────
 
+# How many tests the template guard collects once it has been copied into a
+# repo. Pinned as a number and compared as one, because the assertion below is
+# the only thing standing between a hollowed-out template and a suite that reads
+# as green: everything after it breaks a repo and checks the guard notices, and
+# a guard that collects two tests notices nothing while satisfying every one of
+# those cases.
+#
+# It was a substring test — `"41 tests collected" in stdout` — which a session of
+# 141 satisfies too. The direction that matters is the count falling, and a
+# substring can see a fall only when the smaller number is not a prefix of the
+# larger. Read the number back and compare it as an integer instead.
+#
+# Bump it when the template gains or loses a test. That is a line in a diff,
+# which is the point: the count is a decision, not an incidental.
+_TEMPLATE_GUARD_TESTS = 41
+
+
 class TestTheGuardPasses:
 
     def test_a_repo_assembled_from_templates_is_green(self, boot, tmp_path):
@@ -187,7 +204,25 @@ class TestTheGuardPasses:
              "-q", "--no-header", "--collect-only", "-p", "no:cacheprovider"],
             capture_output=True, text=True,
         )
-        assert "41 tests collected" in result.stdout, result.stdout[-600:]
+        # Checked separately so a session that never collected reports as itself
+        # rather than as a wrong count — a collection error and a shrunken suite
+        # are different problems and the message has to say which one this is.
+        collected = re.search(r"(\d+) tests? collected", result.stdout)
+        assert collected, (
+            "pytest reported no collection count for the template guard, so it "
+            "did not get as far as collecting.\n"
+            "That is an import error or a syntax error in the copied file, not a "
+            "count that drifted.\n\n" + result.stdout[-600:]
+        )
+        assert int(collected.group(1)) == _TEMPLATE_GUARD_TESTS, (
+            f"the template guard collects {collected.group(1)} tests, not "
+            f"{_TEMPLATE_GUARD_TESTS}.\n"
+            "If the template gained or lost a test on purpose, update "
+            "_TEMPLATE_GUARD_TESTS. If it did not, tests are no longer being "
+            "collected — a class renamed out of pytest's convention collects "
+            "nothing and raises nothing, and every mutation below would still "
+            "fail on the tests that remain.\n\n" + result.stdout[-600:]
+        )
 
     def test_the_readme_states_the_right_number_of_mutations(self):
         # README.md quotes this count in prose. The stale `# 48 tests` it used to
