@@ -445,16 +445,25 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     open. Disposition is what keeps that safe.
 
     **An orphaned filter key is dropped only when it provably is not the
-    previous event's.** An event carries one ``branches:``, so once that event's
-    own filter has been read, a second one below a comment cannot belong to it —
-    dropping it is not a guess, and the event keeps the specific answer that
-    makes the assertion below say something true. But when the event above is
-    still *bare*, the orphan is genuinely ambiguous: it is either that event's
-    filter with a note wrongly read as a key above it, or the commented event's
-    filter. Nothing in the text distinguishes them. So this refuses, the way
-    ``_scalar`` refuses a block scalar — the two readings fail in opposite
-    directions, one reporting a filter the event may not have and one reading as
-    no filter at all, and *that* one passes.
+    previous event's**, which is narrower than it first looks. An event carries
+    one of *each* filter key, so an orphan repeating a key that event has
+    already been read for cannot also be its own, and the event keeps the
+    specific answer that makes the assertion below say something true. An event
+    already unproven is the other case: ``[]`` is the most conservative answer
+    there is and no orphan can move it.
+
+    "The event has *an* answer" is the tempting version of that test and it is
+    wrong, because the keys are not interchangeable. An event is filtered by
+    ``branches:`` and ``paths:`` at once, so a ``paths:`` orphaned under a note
+    is the live event's real filter, and dropping it reads a path-filtered
+    workflow as unfiltered — the fail-open this whole function exists to avoid.
+
+    Otherwise the orphan is genuinely ambiguous: it is either the live event's
+    filter with a note wrongly read as a key above it, or the commented event's.
+    Nothing in the text distinguishes them. So this refuses, the way ``_scalar``
+    refuses a block scalar — the two readings fail in opposite directions, one
+    reporting a filter the event may not have and one reading as no filter at
+    all, and *that* one passes.
 
     The cost is stated rather than papered over, because it is the cry-wolf
     direction this docstring argues against everywhere else: a correct workflow
@@ -467,6 +476,9 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
     """
     filters: dict[str, list[str] | None] = {}
     unproven: set[str] = set()
+    # Which filter keys each event has actually been read for. An orphan can be
+    # dropped only against this, not against whether the event has an answer.
+    seen: dict[str, set[str]] = {}
     lines = workflow.read_text(encoding="utf-8").splitlines()
 
     header = start = None
@@ -508,7 +520,14 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
             # above is real and its filter is then reported as something it is
             # not.
             if _COMMENTED_EVENT.match(line):
-                suspended, current = current, None
+                # Only the first of a run of these carries the live event.
+                # Overwriting on the second — a commented event whose own
+                # sub-keys are commented out under it, which is how a block is
+                # normally disabled — would lose it and refuse a shape the rule
+                # below can settle.
+                if current is not None:
+                    suspended = current
+                current = None
             continue
         if not line.startswith(" "):
             break
@@ -529,24 +548,38 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
         key = key_pattern.match(line)
         if not key:
             continue
+        name, value = key.group(1), _strip_comment(key.group(2))
         if current is None:
             # Orphaned: a filter key under a comment this read as an event key.
-            # Safe to drop once the event above has an answer of its own, since
-            # an event carries one `branches:` and this cannot be it.
+            # Dropping it is safe in exactly two cases, and both are provable
+            # rather than likely.
+            #
+            # It repeats a key the event above has already been read for. An
+            # event carries one of each filter key, so a second one cannot also
+            # be that event's, and the event keeps the specific answer it had.
+            #
+            # Or that event is already unproven, which is `[]`, the most
+            # conservative answer there is. No orphan can make it worse.
+            #
+            # Testing whether the event merely has *an* answer is not enough and
+            # was the bug: an event carries `branches:` and `paths:` at once, so
+            # a `paths:` orphaned under a note is that event's real filter, and
+            # dropping it leaves a path-filtered workflow reading as unfiltered
+            # — which passes, on a workflow whose checks may never report.
             if suspended is not None and (
-                filters.get(suspended) is not None or suspended in unproven
+                name in seen.get(suspended, ()) or suspended in unproven
             ):
                 continue
             raise ValueError(
                 f"{workflow}: `{line.strip()}` is indented under a commented-out "
-                "event key, and the event above it declares no filter of its "
-                "own, so this parser cannot tell which of the two it filters.\n"
+                "event key, and this parser cannot tell whether it filters that "
+                "event or the live one above it.\n"
                 "Refused rather than guessed at: read as the live event's, it "
                 "reports a filter that event may not have; dropped, it reads as "
                 "no filter at all — and no filter passes this check. Move the "
                 "note off the event indent, or delete the commented-out block."
             )
-        name, value = key.group(1), _strip_comment(key.group(2))
+        seen.setdefault(current, set()).add(name)
         inline = re.fullmatch(r"\[(.*)\]", value)
         if name == "branches" and inline:
             filters[current] = [
@@ -1189,6 +1222,47 @@ class TestGuardIsNotVacuous:
         )
         # `paths:` already made it unproven; the orphan must not overwrite that.
         assert _trigger_branches(workflow) == {"pull_request": []}
+
+    def test_an_orphan_of_a_different_key_is_not_dropped(self, tmp_path):
+        # The reverse direction, and the one that matters: the filter keys are
+        # not interchangeable. `pull_request` is filtered by `branches:` AND by
+        # `paths:`, so the orphaned `paths:` here is its own — dropping it on
+        # the grounds that it "already has an answer" reports the event as
+        # covering `main` when the path filter may stop it running at all.
+        #
+        # Asserted as a refusal rather than as `[]` because the parser cannot
+        # actually tell whose it is; what it must not do is drop it.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request:\n"
+            "    branches: [main]\n"
+            "  # NOTE: keep an eye on this\n"
+            "    paths: ['src/**']\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="commented-out event key"):
+            _trigger_branches(workflow)
+
+    def test_a_run_of_commented_lines_keeps_the_event_it_ended(self, tmp_path):
+        # Commenting out an event takes its sub-keys with it, so a run of these
+        # is the normal shape rather than an odd one. Only the first line ends a
+        # live event; if a later one overwrote what the first remembered, the
+        # orphan below would be refused instead of settled, and a correct
+        # workflow would stop the suite.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "on:\n"
+            "  pull_request:\n"
+            "    branches: [develop]\n"
+            "  # workflow_run:\n"
+            "  #   types: [completed]\n"
+            "    branches: [main]\n"
+            "jobs:\n",
+            encoding="utf-8",
+        )
+        assert _trigger_branches(workflow) == {"pull_request": ["develop"]}
 
     def test_an_unreadable_filter_beats_a_readable_one_on_the_same_event(self, tmp_path):
         # Order-independence, asserted in both directions. An event filtered by
