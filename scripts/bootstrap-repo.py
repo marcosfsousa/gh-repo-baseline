@@ -335,6 +335,15 @@ def _job_contexts(workflow: Path) -> list[str]:
     tokens are the exception and the only one: ``strategy: null`` has no block
     below it and so no matrix that could exist.
 
+    An id GitHub itself would reject stops the run: ``2fa:`` and ``-x:`` are both
+    refused, because GitHub requires the first character of a job id to be a
+    letter or ``_``. It is the one shape here that can refuse a workflow which
+    bootstrapped before the rule was tightened, so it is stated rather than left
+    to the message -- what it costs is a workflow GitHub would not run either
+    way. Whitespace before the colon is refused on the whitespace and not on the
+    charset: ``build :`` is a legal YAML key whose id is ``build``, and blaming
+    the characters sends the reader to inspect an id whose characters are fine.
+
     The copy in ``templates/tests/test_required_checks.py`` returns
     ``{job id: context}`` where this returns just the contexts — it needs the id
     to name the job whose ``name:`` moved, and this only needs the strings to
@@ -410,6 +419,21 @@ def _job_contexts(workflow: Path) -> list[str]:
                     "This parser stops rather than attributing the keys below it "
                     "to the job above."
                 )
+            if job_id != job_id.rstrip():
+                # `build :` is a legal YAML key whose id is `build`, and GitHub
+                # runs it. The charset check below would refuse it too, but on
+                # characters that are all permitted -- sending the reader to
+                # rename a job over a space. The refusal stands, because a job id
+                # is the context string and this parser reads it literally rather
+                # than deciding which spaces are insignificant, but it has to
+                # name the space it stopped on.
+                sys.exit(
+                    f"{workflow}: `{job_id}:` puts whitespace between the job id "
+                    f"and its colon.\nYAML allows it and GitHub reads the id as "
+                    f"{job_id.rstrip()!r}. This parser reads a job id literally, "
+                    "so it stops here rather than guessing which spaces are "
+                    "insignificant. Close the gap."
+                )
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", job_id):
                 sys.exit(
                     f"{workflow}: {job_id!r} is not a job id this parser can "
@@ -421,14 +445,14 @@ def _job_contexts(workflow: Path) -> list[str]:
             current, body, strategy, in_strategy = job_id, None, None, False
             contexts[current] = current  # the id is the context until a name says otherwise
             continue
-        if jobs_indent is None:
-            # Nothing key-shaped has been seen yet, so this line sits where the
-            # first job id belongs and is not one. A mapping cannot open with a
-            # sequence item or a bare scalar, so this is not a `jobs:` block.
+        if current is None:
+            # No job has been read yet, so this line sits where the first job id
+            # belongs and is not one. A mapping cannot open with a sequence item
+            # or a bare scalar, so this is not a `jobs:` block.
             #
             # Skipping it instead is a fail-open, and a subtle one: the line is
-            # passed over, `jobs_indent` stays unset, and the next key-shaped
-            # line seeds it -- but that line is a key *inside* the item, one
+            # passed over, nothing is seeded, and the next key-shaped line seeds
+            # the width instead -- but that line is a key *inside* the item, one
             # level too deep. `jobs:` / `- build:` / `steps:` collects a job
             # called `steps` and requires a context no job reports, which leaves
             # every pull request pending rather than red.
@@ -438,14 +462,19 @@ def _job_contexts(workflow: Path) -> list[str]:
             # was refused on its id. Reading the indent rather than fixing it is
             # what makes the seed worth guarding -- a fixed column refused this
             # by collecting nothing, loudly.
+            #
+            # Asked of `current` rather than of `jobs_indent`: the branch above
+            # seeds both or stops, so it is the same question, and asking it
+            # about the name the rest of the loop actually uses leaves no second
+            # `current is None` test below it. That one was unreachable from the
+            # moment this refusal was added, and unreachable code that reads as
+            # defensive is worse than none.
             sys.exit(
                 f"{workflow}: `jobs:` opens with {line.strip()!r}, which is not "
                 "a job id.\nA job id maps to a block; this is a sequence item or "
                 "a scalar. This parser stops rather than reading the keys inside "
                 "it as jobs."
             )
-        if current is None:
-            continue
         key = _key(line)
         if key is None:
             # A step's `- uses:`, a block scalar's contents, a bare list item.

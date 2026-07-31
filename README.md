@@ -93,7 +93,9 @@ What the suite actually asserts, since "the guard passes" is nearly worthless on
 its own:
 
 - **`tests/test_bootstrap.py`** — the parser across every shape YAML allows
-  (including the quoted, null and block-scalar names it refuses to guess at), the
+  (including the quoted, null and block-scalar names it refuses to guess at, and
+  the job ids GitHub itself rejects — a first character that is not a letter or
+  `_` stops the run rather than becoming a required context), the
   ruleset body (retargeting, strict mode, omit-vs-empty), and that comparison is
   order-insensitive. That last one is a regression test: the API returns required
   checks in workflow-declaration order, so comparing raw made the tool report a
