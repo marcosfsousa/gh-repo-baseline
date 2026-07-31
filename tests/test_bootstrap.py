@@ -135,7 +135,10 @@ class TestJobContexts:
             "        python-version: ['3.11', '3.12']\n",
             encoding="utf-8",
         )
-        with pytest.raises(SystemExit, match="pytest"):
+        # Matched on the refusal's own wording, not on the bare job id: the
+        # message carries the workflow path, and a tmp path contains `pytest`,
+        # so `match="pytest"` passes on a message that names no job at all.
+        with pytest.raises(SystemExit, match=r"job 'pytest': is a matrix job"):
             boot._job_contexts(workflow)
 
     def test_a_strategy_without_a_matrix_is_not_refused(self, boot, tmp_path):

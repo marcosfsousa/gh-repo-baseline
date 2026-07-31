@@ -6,7 +6,7 @@
 That file is a guard, and a guard that cannot go red is not a guard. Asserting it
 passes on a correct repo proves almost nothing — a file containing no assertions
 at all would do the same. So this suite assembles a throwaway repo out of
-``templates/``, checks the guard passes, and then breaks the repo fifteen
+``templates/``, checks the guard passes, and then breaks the repo sixteen
 different ways and checks the guard fails **on exactly the intended tests and no
 others**.
 
@@ -209,7 +209,7 @@ class TestTheGuardPasses:
         )
 
 
-# ── The guard on fifteen broken repos ────────────────────────────────────────
+# ── The guard on sixteen broken repos ────────────────────────────────────────
 #
 # Each entry is (label, mutation, the exact set of tests that must fail).
 
