@@ -117,6 +117,19 @@ def _strip_comment(value: str) -> str:
     return re.split(r"(?:^|\s)#", value, maxsplit=1)[0].strip()
 
 
+# The unquoted spellings of null in YAML's core schema. `NULL` and `Null` are
+# null; `nUll` is not, and is an ordinary string.
+#
+# Named rather than repeated because every place a key's value is inspected has
+# to answer the same question — is there a value here at all — and answering it
+# differently in different places is what this fixes. `jobs: null` and
+# `strategy: null` were each read as "carries a value", so a key that says
+# nothing was refused with a message describing a flow mapping that was not
+# there. Quoted, these are strings and keep their value, so the comparison
+# happens after any quotes have been dealt with, never before.
+_NULL_TOKENS = ("~", "null", "Null", "NULL")
+
+
 def _key(line: str) -> tuple[int, str, str] | None:
     """
     ``(indent, key, raw value)`` for a line that is a mapping key, else ``None``.
@@ -226,7 +239,7 @@ def _scalar(value: str) -> str | None:
     # Unquoted, so the null tokens resolve to null and the job id stands. `NULL`
     # and `Null` are null in YAML's core schema; `nUll` is not, and is a string.
     stripped = _strip_comment(value)
-    return None if stripped in ("", "~", "null", "Null", "NULL") else stripped
+    return None if stripped in ("", *_NULL_TOKENS) else stripped
 
 
 def _job_contexts(workflow: Path) -> dict[str, str]:
@@ -236,11 +249,13 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
     Keyed by id so a failure can name the job whose ``name:`` moved rather than
     only the string that disappeared.
 
-    Job ids sit at two spaces under ``jobs:``. **Everything below one is placed
-    by comparing indents**: the first key under a job fixes the indent that
-    job's own keys sit at, and ``name:``, ``uses:`` and ``strategy:`` count only
-    where they sit at it. Step names are list items and are therefore excluded
-    structurally, not by pattern — see ``test_step_names_are_not_collected``.
+    **Every level is placed by comparing indents, and none is assumed.** The
+    first key-shaped line inside ``jobs:`` fixes the indent the job ids sit at,
+    and the first key under a job fixes the indent that job's own keys sit at —
+    so ``name:``, ``uses:`` and ``strategy:`` count where they sit at the
+    latter, and a job id is a line that sits at the former. Step names are list
+    items and are therefore excluded structurally, not by pattern — see
+    ``test_step_names_are_not_collected``.
 
     Matching each of those keys at a fixed column instead was a fail-open with
     no symptom. Four-space-per-level indentation is ordinary YAML and GitHub
@@ -250,6 +265,13 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
     bare job id that GitHub never reports. A job whose own keys sit at two
     different indents is refused rather than half-read, which is the one shape
     comparing indents can get wrong.
+
+    The job ids kept that fixed column one round longer, and failed the other
+    way when it was wrong: a four-space ``jobs:`` block matched no job at all,
+    which the guard reports as nothing collected rather than as a context it
+    quietly got wrong. Loud, and still worth removing — the assumption was the
+    same one, in the same loop, two lines up from where it had already been
+    given up.
 
     **A job key is recognised by its shape before its id is read**, so a key this
     cannot vouch for stops the parse instead of being skipped. Skipping was two
@@ -278,6 +300,11 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
         ``matrix:`` inside it — a flow mapping needs a real parser, and the only
         answer worth giving here is "stop".
 
+        The null tokens are the exception, and the only one: ``strategy: null``
+        has no block below it and so no ``matrix:`` that could exist, which
+        makes it the one inline value provably safe to read past. Refusing it
+        described a matrix that was not there.
+
     All three are refused rather than guessed at because they fail the same way
     when guessed wrong: a required context nothing reports, and a pull request
     that sits pending rather than red.
@@ -292,7 +319,10 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
         key = _key(line)
         if key and key[0] == 0 and key[1] == "jobs":
             inline = _strip_comment(key[2])
-            if inline:
+            # A null is not a value to refuse: `jobs: null` is a workflow with no
+            # jobs, which `test_jobs_are_collected` already reports as the empty
+            # result it is. Refusing here blamed a flow mapping nobody wrote.
+            if inline and inline not in _NULL_TOKENS:
                 raise ValueError(
                     f"{workflow}: `jobs:` carries the value {inline!r}.\n"
                     "The jobs block is read by indentation, so a flow mapping is "
@@ -311,6 +341,7 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
         )
 
     current: str | None = None
+    jobs_indent: int | None = None  # the indent the job ids themselves sit at
     body: int | None = None      # the indent `current`'s own keys sit at
     strategy: int | None = None  # the indent the keys inside its `strategy:` sit at
     in_strategy = False
@@ -320,13 +351,25 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
         # A non-indented key ends the jobs block.
         if not line.startswith(" "):
             break
-        # Matched on the key *shape* — two spaces, then anything up to a colon —
+        # Matched on the key *shape* — an indent, then anything up to a colon —
         # rather than on the id charset, so an id this cannot read is refused
         # below instead of falling through to the `name:` branch with `current`
         # still naming the previous job.
-        key = re.match(r"^  (\S[^:]*):(.*)$", line)
-        if key:
-            job_id, trailing = key.group(1), _strip_comment(key.group(2))
+        #
+        # The indent is read off the first such line rather than fixed at two,
+        # for the reason the keys below a job are: two is only the common
+        # spelling. A `jobs:` block indented four per level is ordinary YAML that
+        # GitHub runs, and against a fixed column it matched nothing — which
+        # collects no jobs at all. That direction is loud rather than silent, so
+        # it was a limitation and not the fail-open this parser was fixed for,
+        # but it is the same assumption in the same file and it costs nothing to
+        # stop making it. The first key-shaped line inside the block is the first
+        # job: comments and blanks are already skipped above, and a mapping
+        # cannot open with anything else.
+        key = re.match(r"^( +)(?!-(?:\s|$))(\S[^:]*):(.*)$", line)
+        if key and (jobs_indent is None or len(key.group(1)) == jobs_indent):
+            jobs_indent = len(key.group(1))
+            job_id, trailing = key.group(2), _strip_comment(key.group(3))
             if trailing:
                 # A job id maps to a block, so anything left after the comment is
                 # stripped is not a job at all.
@@ -391,7 +434,7 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
             )
         if name == "strategy":
             inline = _strip_comment(value)
-            if inline:
+            if inline and inline not in _NULL_TOKENS:
                 raise ValueError(
                     f"{workflow}, job {current!r}: `strategy:` carries the inline "
                     f"value {inline!r}.\nA `matrix:` written inside it composes "
@@ -399,7 +442,10 @@ def _job_contexts(workflow: Path) -> dict[str, str]:
                     "neither out of a flow mapping. Write the strategy as a "
                     "block, or require each combination explicitly."
                 )
-            in_strategy = True
+            # A null strategy has no block below it and therefore no `matrix:` to
+            # find, so there is nothing to enter. It is the one value here that
+            # is provably harmless: refusing it named a matrix that cannot exist.
+            in_strategy = not inline
             continue
         if name == "name":
             # A refusal propagates and fails the suite, naming the job. That is
@@ -750,7 +796,7 @@ def _trigger_branches(workflow: Path) -> dict[str, list[str] | None]:
             # flow mapping, and an event whose filter cannot be read is unproven
             # rather than unfiltered.
             inline_value = _strip_comment(event.group(2))
-            if inline_value and inline_value not in ("~", "null", "Null", "NULL"):
+            if inline_value and inline_value not in _NULL_TOKENS:
                 unproven.add(current)
             continue
         key = key_pattern.match(line)
@@ -1212,6 +1258,107 @@ class TestGuardIsNotVacuous:
         )
         with pytest.raises(ValueError, match="inline value"):
             _job_contexts(workflow)
+
+    @pytest.mark.parametrize("null", ["null", "~", "Null", "NULL", "null  # none"])
+    def test_a_null_strategy_is_not_an_inline_one(self, tmp_path, null):
+        # The refusal above reads any value after `strategy:` as a flow mapping
+        # with a matrix hidden in it. A null has no block below it, so there is
+        # no matrix it could be hiding — and stopping the parse to announce one
+        # is the guard failing a workflow GitHub runs without complaint.
+        #
+        # The same tokens `_scalar` treats as null, because a workflow that
+        # writes one of them here means by it exactly what it means there.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            f"jobs:\n"
+            f"  pytest:\n"
+            f"    strategy: {null}\n"
+            f"    name: The gate\n",
+            encoding="utf-8",
+        )
+        assert _job_contexts(workflow) == {"pytest": "The gate"}
+
+    def test_a_quoted_null_strategy_is_still_refused(self, tmp_path):
+        # The bound on the case above. Quoted, `null` is an ordinary string and
+        # not a null at all, so the value is a value and this stops — the same
+        # asymmetry `_scalar` keeps between `name: null` and `name: 'null'`.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  pytest:\n"
+            "    strategy: 'null'\n"
+            "    name: The gate\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="inline value"):
+            _job_contexts(workflow)
+
+    @pytest.mark.parametrize("width", [1, 2, 3, 4, 8])
+    def test_the_jobs_block_may_be_indented_any_width(self, tmp_path, width):
+        # Two spaces is the common spelling of a `jobs:` block, not the required
+        # one. Pinned to two, everything but the middle case here collected no
+        # jobs — the guard then has nothing to compare the ruleset against, and
+        # says so, which is why this was a limitation rather than the fail-open
+        # the keys below a job had. The refusals still have to be reachable at
+        # whatever width the file uses, which is what the next two cases check.
+        pad = " " * width
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            f"jobs:\n"
+            f"{pad}pytest:\n"
+            f"{pad * 2}name: The gate\n"
+            f"{pad * 2}steps:\n"
+            f"{pad * 3}- uses: actions/checkout@v4\n"
+            f"{pad}lint:\n"
+            f"{pad * 2}runs-on: ubuntu-latest\n",
+            encoding="utf-8",
+        )
+        assert _job_contexts(workflow) == {"pytest": "The gate", "lint": "lint"}
+
+    def test_a_matrix_is_refused_at_a_width_the_parser_was_never_pinned_to(self, tmp_path):
+        # The reason the case above is not enough on its own. Reading the ids at
+        # the wrong indent does not misread a job, it drops it — and a dropped
+        # job reaches none of the refusals, so a matrix at four-per-level would
+        # have gone unmentioned rather than wrong.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "    pytest:\n"
+            "        strategy:\n"
+            "            matrix:\n"
+            "                python-version: ['3.11', '3.12']\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="matrix job"):
+            _job_contexts(workflow)
+
+    def test_a_job_id_at_the_wrong_indent_does_not_start_a_job(self, tmp_path):
+        # The bound. The first job fixes the width, so a second id written at a
+        # different one does not quietly become a job: it falls through to the
+        # keys of the job above, sits at an indent that job's own keys do not
+        # use, and is refused there. Reading it as a job instead would mean
+        # taking any indent as a job id, which is the fixed column's opposite
+        # error rather than its absence.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text(
+            "jobs:\n"
+            "  first:\n"
+            "    name: A\n"
+            "   second:\n"
+            "     name: B\n",
+            encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="sits at 3 spaces"):
+            _job_contexts(workflow)
+
+    def test_a_null_jobs_block_has_no_jobs_rather_than_an_unreadable_one(self, tmp_path):
+        # `jobs: null` is a workflow with no jobs. That is worth reporting, and
+        # `test_jobs_are_collected` reports it — as nothing collected, which is
+        # what it is. What this must not do is refuse it as a flow mapping,
+        # sending the reader to look for braces that were never written.
+        workflow = tmp_path / "w.yml"
+        workflow.write_text("jobs: ~\n", encoding="utf-8")
+        assert _job_contexts(workflow) == {}
 
     def test_a_step_key_called_matrix_is_not_a_matrix_job(self, tmp_path):
         # The cost of recognising `matrix:` more loosely, and the bound on it.

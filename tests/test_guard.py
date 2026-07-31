@@ -100,11 +100,27 @@ def _assemble(root, boot):
 
 
 def _run_guard(root) -> tuple[int, set[str]]:
-    """``(exit code, {names of failing tests})``."""
+    """
+    ``(exit code, {names of failing tests})``.
+
+    ``--color=no`` is load-bearing rather than tidiness. The names are read out
+    of the ``-rf`` summary by matching the literal ``FAILED`` at line start, and
+    pytest colours that word whenever colour is forced — ``FORCE_COLOR`` in the
+    environment is honoured even though this output is captured, which is
+    exactly the case that matters. The prefix then matches nothing, every name
+    goes missing, and all sixteen mutations below report that the guard fired on
+    the wrong tests.
+
+    That reads as sixteen regressions in the guard rather than one bug in this
+    reader, and it reads that way most convincingly right after a change to the
+    parser those mutations exercise. So the setting is pinned rather than
+    inherited: this run's colour is nobody's preference, and the only thing read
+    back out of it is a machine-parsed summary line.
+    """
     result = subprocess.run(
         [
             sys.executable, "-m", "pytest", str(root / "tests"),
-            "-q", "--no-header", "-rf", "-p", "no:cacheprovider",
+            "-q", "--no-header", "-rf", "--color=no", "-p", "no:cacheprovider",
         ],
         capture_output=True, text=True,
     )
@@ -185,7 +201,7 @@ def _require_context(root, context: str) -> None:
 #
 # Bump it when the template gains or loses a test. That is a line in a diff,
 # which is the point: the count is a decision, not an incidental.
-_TEMPLATE_GUARD_TESTS = 51
+_TEMPLATE_GUARD_TESTS = 65
 
 
 class TestTheGuardPasses:
@@ -201,7 +217,8 @@ class TestTheGuardPasses:
         root = _assemble(tmp_path / "repo", boot)
         result = subprocess.run(
             [sys.executable, "-m", "pytest", str(root / "tests"),
-             "-q", "--no-header", "--collect-only", "-p", "no:cacheprovider"],
+             "-q", "--no-header", "--collect-only", "--color=no",
+             "-p", "no:cacheprovider"],
             capture_output=True, text=True,
         )
         # Checked separately so a session that never collected reports as itself
@@ -258,6 +275,37 @@ class TestTheGuardPasses:
 # ── The guard on seventeen broken repos ──────────────────────────────────────
 #
 # Each entry is (label, mutation, the exact set of tests that must fail).
+
+class TestTheFailureNamesAreReadBack:
+    """
+    ``_run_guard`` reads the names of failing tests out of pytest's own output,
+    which makes that output part of this suite's contract rather than a display
+    detail.
+
+    Worth asserting on its own because the failure lands one layer away from its
+    cause. Every mutation below compares the *set* of names, so a reader that
+    returns an empty one turns a single bug here into sixteen failures over
+    there, each claiming the guard fired on the wrong tests — a report that
+    points at the guard, then at the parser, and never at this function.
+    """
+
+    def test_forced_colour_does_not_hide_them(self, boot, tmp_path, monkeypatch):
+        # Not a contrived environment: pytest honours FORCE_COLOR even when its
+        # output is captured, and the nested run inherits it from this process.
+        # Any CI job or wrapper that sets it puts the suite in this state.
+        monkeypatch.setenv("FORCE_COLOR", "3")
+        root = _assemble(tmp_path / "repo", boot)
+        _set_top_level(root, "enforcement", "disabled")
+
+        code, failed = _run_guard(root)
+
+        assert code != 0
+        assert failed == {"test_it_is_actively_enforced"}, (
+            "the failing test's name did not survive being read back out of the "
+            f"nested run: {sorted(failed)}.\nAn empty set means colour reached "
+            "the summary line and the `FAILED` prefix matched nothing."
+        )
+
 
 MUTATIONS = [
     pytest.param(
